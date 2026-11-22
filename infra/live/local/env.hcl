@@ -23,6 +23,17 @@ locals {
   # Client-credentials client for curl tests. Never enabled outside local.
   enable_test_client = true
 
+  # LDAP federation (keycloak-ldap): Keycloak, in Docker, reaches OpenLDAP
+  # by its compose service name. Dev-only admin bind from compose.yaml.
+  connection_url  = "ldap://openldap:389"
+  bind_dn         = "cn=admin,dc=warden,dc=local"
+  bind_credential = "admin"
+
+  # Simulated bank customers in realm nordbank (keycloak-broker), dev only.
+  bank_users = {
+    nora = { first_name = "Nora", last_name = "Bankcustomer", email = "nora@nordbank.example", password = "nora-dev-password" }
+  }
+
   # Synthetic seed users, dev only.
   seed_users = {
     anna = { first_name = "Anna", last_name = "Policyholder", email = "anna@example.test", password = "anna-dev-password", roles = ["policyholder"], partner_id = "" }

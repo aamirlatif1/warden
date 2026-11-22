@@ -6,14 +6,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-jose/go-jose/v4"
 
+	"github.com/aamirlatif1/warden/internal/ratelimit/ginlimit"
 	"github.com/aamirlatif1/warden/internal/sts/app"
 )
 
@@ -35,6 +39,18 @@ type Services struct {
 	Tokens    TokenService
 	Lifecycle LifecycleService
 	Keys      KeySet
+	// Limits rate-limits /token. Nil fields disable that rule.
+	Limits TokenLimits
+}
+
+// TokenLimits are /token's budgets: per client IP (checked before the body
+// is read) and per claimed client_id (after). The client_id is not yet
+// authenticated, so anyone can spend a partner's budget: PerClient must be
+// generous enough that this costs the partner little, and PerIP is what
+// stops one source hammering the endpoint.
+type TokenLimits struct {
+	PerIP     ginlimit.Limiter
+	PerClient ginlimit.Limiter
 }
 
 type Config struct {
@@ -86,10 +102,20 @@ func NewRouter(cfg Config, svc Services, log *slog.Logger) *gin.Engine {
 	}
 
 	r := gin.New()
+	// ClientIP() = TCP peer; X-Forwarded-For from clients is ignored, so the
+	// per-IP limit can't be dodged by rotating that header.
+	_ = r.SetTrustedProxies(nil)
 	r.Use(gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, rec any) {
 		log.ErrorContext(c.Request.Context(), "panic in handler", "path", c.FullPath(), "panic", rec)
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": app.ErrServerError})
 	}))
+
+	tokenChain := []gin.HandlerFunc{}
+	if svc.Limits.PerIP != nil {
+		tokenChain = append(tokenChain, ginlimit.Middleware(log, nil,
+			ginlimit.Rule{Name: "sts_token_ip", Limiter: svc.Limits.PerIP, Key: ginlimit.ByIP}))
+	}
+	perClient := ginlimit.Rule{Name: "sts_token_client", Limiter: svc.Limits.PerClient, Key: claimedClientID}
 
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 
@@ -105,11 +131,14 @@ func NewRouter(cfg Config, svc Services, log *slog.Logger) *gin.Engine {
 		c.JSON(http.StatusOK, keys.JWKS())
 	})
 
-	r.POST("/token", func(c *gin.Context) {
+	r.POST("/token", append(tokenChain, func(c *gin.Context) {
 		// RFC 6749 §5.1: token responses must not be cached.
 		c.Header("Cache-Control", "no-store")
 		c.Header("Pragma", "no-cache")
 		if !readForm(c, cfg.MaxBodyBytes, "grant_type", "client_assertion", "client_assertion_type", "client_id", "scope") {
+			return
+		}
+		if perClient.Limiter != nil && !ginlimit.Check(c, log, nil, perClient) {
 			return
 		}
 		resp, err := tokens.Token(c.Request.Context(), app.TokenRequest{
@@ -129,7 +158,7 @@ func NewRouter(cfg Config, svc Services, log *slog.Logger) *gin.Engine {
 			"expires_in":   resp.ExpiresIn,
 			"scope":        resp.Scope,
 		})
-	})
+	})...)
 	// RFC 7009. Always 200 for a well-formed, authenticated request, even
 	// for an unknown token.
 	r.POST("/revoke", func(c *gin.Context) {
@@ -175,6 +204,40 @@ func NewRouter(cfg Config, svc Services, log *slog.Logger) *gin.Engine {
 // readForm caps the body, requires a form content type, parses the body
 // (never the query string: RFC 6749 §2.3.1) and rejects repeated
 // parameters (RFC 6749 §3.2). It writes the error response itself.
+// claimedClientID is the client_id a /token request claims: the form
+// parameter, else the iss of the (not yet verified) client assertion. Only
+// a rate-limit key: never used for anything that needs it to be true.
+func claimedClientID(c *gin.Context) string {
+	if id := c.PostForm("client_id"); id != "" {
+		return limitKey(id)
+	}
+	parts := strings.Split(c.PostForm("client_assertion"), ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var cl struct {
+		Iss string `json:"iss"`
+	}
+	if json.Unmarshal(payload, &cl) != nil {
+		return ""
+	}
+	return limitKey(cl.Iss)
+}
+
+// limitKey bounds an attacker-chosen key: client_ids are short, anything
+// longer is hashed so it can't bloat Redis keys.
+func limitKey(id string) string {
+	if len(id) <= 64 {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
 func readForm(c *gin.Context, maxBytes int64, single ...string) bool {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 	if c.ContentType() != "application/x-www-form-urlencoded" {

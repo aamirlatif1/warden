@@ -88,8 +88,10 @@ resource "keycloak_openid_client" "test" {
 resource "keycloak_client_scope_assignments" "test" {
   count = var.enable_test_client ? 1 : 0
 
-  realm_id        = keycloak_realm.this.id
-  client_id       = keycloak_openid_client.test[0].id
-  default_scopes  = local.default_scopes
+  realm_id  = keycloak_realm.this.id
+  client_id = keycloak_openid_client.test[0].id
+  # Keycloak 26 attaches its built-in service_account scope to every client
+  # with service accounts enabled; listing it keeps the plan empty.
+  default_scopes  = concat(local.default_scopes, ["service_account"])
   optional_scopes = local.optional_scopes
 }

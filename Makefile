@@ -35,7 +35,7 @@ STS_PUBLISH_LEAD      ?= 10m
 .PHONY: help up down clean tools infra infra-plan infra-check check-s1 \
 	proto-tools proto proto-lint test bench run-api check-s2 \
 	test-db seed check-s3 kms-key partner-keys sts-seed run-sts demo-partner \
-	rotate-under-load pki run-bff run-claims-app
+	rotate-under-load pki run-bff run-claims-app infra-cognito
 
 help: ## List targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -62,6 +62,11 @@ infra-plan: tools ## Plan all Keycloak config
 
 infra-check: tools ## Fail if a plan shows any change (drift / non-idempotent config)
 	$(TG) run --all --non-interactive plan -- -detailed-exitcode -lock=false
+
+infra-cognito: tools ## Validate and test the Cognito module against a mocked AWS provider (never applied)
+	docker run --rm -v $(CURDIR)/infra/modules/cognito-user-pool:/m -v warden-plugin-cache:/plugin-cache \
+		-e TF_DATA_DIR=/tmp/tfdata -w /m $(TOOLS_IMAGE) \
+		sh -c 'tofu init -backend=false -input=false -lockfile=readonly >/dev/null 2>&1 || tofu init -backend=false -input=false >/dev/null; tofu validate && tofu test; rm -f .terraform.lock.hcl'
 
 check-s1: ## S1 acceptance: discovery document is served and a plan shows no changes
 	@curl -sf $(KEYCLOAK_URL)/realms/insurance/.well-known/openid-configuration \
@@ -110,7 +115,7 @@ test-db: ## Integration tests against compose Postgres, Redis and LocalStack KMS
 	WARDEN_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' WARDEN_TEST_REDIS_ADDR=localhost:6379 \
 	WARDEN_TEST_KMS_ENDPOINT=http://localhost:4566 \
 		go test -race -count=1 ./internal/policy/adapters/pgstore/ ./internal/sts/adapters/... ./internal/kms/ ./internal/revocation/ \
-		./internal/bff/adapters/redisstore/
+		./internal/bff/adapters/redisstore/ ./internal/ratelimit/
 
 seed: tools ## Load demo policies and claims, owned by the Keycloak seed users (needs make infra)
 	@set -euo pipefail; \

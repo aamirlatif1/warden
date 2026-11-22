@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-In progress (S0–S6 scaffolding done; hand-build bodies in `internal/authn`,
+In progress (S0–S7 scaffolding done; hand-build bodies in `internal/authn`,
 `internal/authn/jwks`, `ginauth`, `grpcauth`, `authz.Decide`,
-`sts/clientauth`, `issuer/keyring`, and the BFF's `AuthService.Callback` and
-`TokenSource.AccessToken` are the author's, still `TODO` stubs until written). Client
+`sts/clientauth`, `issuer/keyring`, the BFF's `AuthService.Callback` and
+`TokenSource.AccessToken`, `bff/logouttoken` and `internal/ratelimit` are the
+author's, still `TODO` stubs until written; the BFF and partner-sts panic at
+startup until `jwks`, `logouttoken` and `ratelimit` exist). Client
 assertions use `aud` = STS issuer identifier only (rfc7523bis), a deliberate
 deviation from FR-4's "token endpoint URL". The source of truth is
 `REQUIREMENTS.md` (FR-1…FR-7, drills, ADRs, Definition of Done) and
@@ -110,6 +112,7 @@ Targets (`make help` lists what exists; `drills`, `demo*` come later):
 - `make kms-key`, `make sts-seed`, `make run-sts` — partner-sts setup (keys in gitignored `.local/`)
 - `make rotate-under-load` — rotation drill (`make run-sts STS_PUBLISH_LEAD=20s`)
 - `make pki`, `make run-bff`, `make run-claims-app` — BFF on :8082 / :8084, mTLS to policy-api :8444
+- `make infra-cognito` — `tofu validate` + `tofu test` (mocked AWS) for the Cognito module; never applied
 
 Single test: `go test -race -run TestName ./internal/authn/`.
 
