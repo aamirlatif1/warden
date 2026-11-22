@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package warden.policy.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// PolicyService is the resource server behind the partner and policyholder
+// flows. Every RPC requires a bearer token (authn interceptor); per-RPC
+// authorization rules are listed on each method and enforced by authz.Decide.
+service PolicyService {
+  // Requires scope quotes:write and token partner_id == request partner_id.
+  rpc CreateQuote(CreateQuoteRequest) returns (CreateQuoteResponse);
+  // Requires role policyholder. Returns only policies whose holder is the caller.
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse);
+  // Requires the caller to own the policy, or role underwriter.
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+  // Requires ownership, acr >= 2 and auth_time within 5 minutes (step-up).
+  rpc UpdatePayoutAccount(UpdatePayoutAccountRequest) returns (UpdatePayoutAccountResponse);
+  // Requires role underwriter and amount <= the caller's approval limit.
+  rpc ApproveClaim(ApproveClaimRequest) returns (ApproveClaimResponse);
+}
+
+message Money {
+  // Amount in minor units (cents).
+  int64 amount_minor = 1;
+  // ISO 4217 code, e.g. "EUR".
+  string currency = 2;
+}
+
+message Quote {
+  string id = 1;
+  string partner_id = 2;
+  string product = 3;
+  Money premium = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message Policy {
+  string id = 1;
+  string holder_subject = 2;
+  string product = 3;
+  string status = 4;
+  // Only the last four characters are ever returned.
+  string payout_iban_masked = 5;
+}
+
+message Claim {
+  string id = 1;
+  string policy_id = 2;
+  Money amount = 3;
+  string status = 4;
+}
+
+message CreateQuoteRequest {
+  string partner_id = 1;
+  string product = 2;
+  Money insured_value = 3;
+}
+
+message CreateQuoteResponse {
+  Quote quote = 1;
+}
+
+message ListPoliciesRequest {}
+
+message ListPoliciesResponse {
+  repeated Policy policies = 1;
+}
+
+message GetPolicyRequest {
+  string id = 1;
+}
+
+message GetPolicyResponse {
+  Policy policy = 1;
+}
+
+message UpdatePayoutAccountRequest {
+  string policy_id = 1;
+  string iban = 2;
+}
+
+message UpdatePayoutAccountResponse {
+  Policy policy = 1;
+}
+
+message ApproveClaimRequest {
+  string claim_id = 1;
+}
+
+message ApproveClaimResponse {
+  Claim claim = 1;
+}

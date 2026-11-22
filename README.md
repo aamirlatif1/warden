@@ -16,7 +16,7 @@ Work in progress. What runs today:
 | --- | --- |
 | Local stack (Keycloak 26, Postgres, Redis, OpenLDAP, LocalStack KMS + Secrets Manager, Grafana LGTM) | Working |
 | Keycloak realm `insurance` as code (OpenTofu + Terragrunt) | Working |
-| `policy-api` (resource server, gRPC + REST) | Planned |
+| `policy-api` (resource server, gRPC + REST) | In progress: API, adapters and authn test suite done; token validator and JWKS cache being written by hand |
 | `partner-sts` (custom token issuer for partners, KMS-signed) | Planned |
 | `bff` (policyholder portal, server-side sessions, step-up) | Planned |
 | SAML federation, LDAP federation, MFA flows | Planned |
@@ -31,6 +31,7 @@ The design, actors, trust boundaries and data flows are in
 - **Docker** with Compose v2. That's all: OpenTofu and Terragrunt run inside a
   container built from `deploy/tools/Dockerfile`, so you don't install them.
 - `make`, `curl` and `jq` for the helper targets.
+- **Go 1.27** for the services (`make test`, `make run-api`).
 - About 4 GB of free memory for the stack.
 
 ## Quick start
@@ -63,6 +64,11 @@ curl -s http://localhost:8080/realms/insurance/.well-known/openid-configuration 
 | `make infra-plan` | Show the plan without applying it |
 | `make infra-check` | Exit non-zero if the plan has any change (drift detection) |
 | `make check-s1` | Discovery document served + no changes in the plan |
+| `make test` | `go test -race ./...` |
+| `make bench` | Token validation benchmarks (`internal/authn`, target < 50 µs/op warm) |
+| `make proto-tools` / `make proto` | Install pinned buf + protoc plugins into `./bin`; lint and regenerate `gen/` |
+| `make run-api` | Run `policy-api` on the host: gRPC `:9090`, REST `:8081` |
+| `make check-s2` | Get a client-credentials token from Keycloak and check `policy-api` accepts it and rejects no / tampered / `alg=none` tokens |
 | `make help` | List the targets |
 
 To start over from nothing: `make clean && make up && make infra`.
@@ -129,9 +135,44 @@ cut -d. -f2 <<<"$TOKEN" | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{iss, aud, 
 
 `aud` contains `policy-api` and `scope` contains `policies`.
 
+## policy-api
+
+The resource server. REST (Gin) and gRPC are two driving adapters over the
+same use cases, and both authenticate with one shared token validator.
+
+| RPC | REST |
+| --- | --- |
+| `CreateQuote` | `POST /v1/quotes` |
+| `ListPolicies` | `GET /v1/policies` (only the caller's policies) |
+| `GetPolicy` | `GET /v1/policies/{id}` |
+| `UpdatePayoutAccount` | `PUT /v1/policies/{id}/payout-account` |
+| `ApproveClaim` | `POST /v1/claims/{id}:approve` |
+
+Token validation (`internal/authn`) makes no network call on the hot path.
+It selects an **issuer profile** by exact `iss` match, and the profile pins
+the algorithm (Keycloak RS256, partner-sts ES256), the audience rule and the
+claim mapping. Keys come from a JWKS cache with a rate-limited, singleflight
+refetch on an unknown `kid`. Every rejection carries a stable reason label
+(`alg_not_allowed`, `kid_unknown`, `aud_mismatch`, ...).
+
+Authorization (`authz.Decide`, ownership, step-up) arrives next; until then
+any valid token reaches the use cases, and data is in memory.
+
 ## Repository layout
 
 ```text
+cmd/policy-api/       composition root
+proto/                buf module (warden.policy.v1)
+gen/                  generated Go code (committed; `make proto`)
+internal/
+  authn/              token validator, issuer profiles, reasons
+    jwks/             JWKS cache (driven adapter)
+    ginauth/          HTTP middleware (driving adapter)
+    grpcauth/         gRPC interceptor (driving adapter)
+  policy/
+    domain/           entities and rules, pure Go
+    app/              use cases and the store interfaces they need
+    adapters/         grpcapi, httpapi (driving); memstore (driven)
 deploy/
   compose.yaml        local stack
   postgres/init.sql   creates the keycloak and warden databases
