@@ -143,3 +143,15 @@ func (s *Store) UpsertPartner(ctx context.Context, p domain.Partner) error {
 	}
 	return s.db.WithContext(ctx).Clauses(clause.OnConflict{UpdateAll: true}).Create(&m).Error
 }
+
+// SetStatus changes a partner's status (suspend / resume).
+func (s *Store) SetStatus(ctx context.Context, clientID string, st domain.PartnerStatus) error {
+	res := s.db.WithContext(ctx).Model(&partnerModel{}).Where("client_id = ?", clientID).Update("status", string(st))
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}

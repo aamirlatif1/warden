@@ -17,7 +17,7 @@ Work in progress. What runs today:
 | Local stack (Keycloak 26, Postgres, Redis, OpenLDAP, LocalStack KMS + Secrets Manager, Grafana LGTM) | Working |
 | Keycloak realm `insurance` as code (OpenTofu + Terragrunt) | Working |
 | `policy-api` (resource server, gRPC + REST) | In progress: API, Postgres store, seed data, authz wiring and the authn/authz test suites done; token validator, JWKS cache and `authz.Decide` being written by hand |
-| `partner-sts` (custom token issuer for partners, KMS-signed) | In progress: token endpoint, discovery, JWKS, KMS and local signers, partner registry, replay store done; `private_key_jwt` verification being written by hand; rotation and revocation next |
+| `partner-sts` (custom token issuer for partners, KMS-signed) | In progress: token, revoke, introspect and admin endpoints, KMS signing, Redis revocation fan-out done; `private_key_jwt` verification and the key-rotation state machine being written by hand |
 | `bff` (policyholder portal, server-side sessions, step-up) | Planned |
 | SAML federation, LDAP federation, MFA flows | Planned |
 | Attack drills, threat model, ADRs | Planned |
@@ -74,7 +74,8 @@ curl -s http://localhost:8080/realms/insurance/.well-known/openid-configuration 
 | `make kms-key` | Create the STS signing key (`ECC_NIST_P256`, alias `alias/warden-sts`) in LocalStack KMS; safe to re-run |
 | `make sts-seed` | Create Shopr's key pair in `.local/` (gitignored) and register Shopr in partner-sts |
 | `make run-sts` | Run `partner-sts` on `:8083` (`WARDEN_SIGNER=kms`, or `local` for a file key) |
-| `make demo-partner` | Partner demo: token, assertion replay refused, quote created, cross-tenant quote 403 |
+| `make demo-partner` | Partner demo: token, assertion replay refused, quote created, cross-tenant quote 403, revoke and suspend measured (401 within 1 s) |
+| `make rotate-under-load` | Rotate the STS signing key while a load loop runs; passes on zero 401s (start `run-sts` with `STS_PUBLISH_LEAD=20s`) |
 | `make check-s2` | Get a client-credentials token from Keycloak and check `policy-api` accepts it and rejects no / tampered / `alg=none` tokens |
 | `make help` | List the targets |
 
@@ -207,8 +208,42 @@ partner registry. No shared secret exists anywhere.
   (also at `openid-configuration`), `GET /jwks.json` (cacheable 5 min).
 
 policy-api trusts it through a second issuer profile (ES256, `typ`
-`at+jwt`, its own JWKS cache). Rotation, revocation and introspection come
-next.
+`at+jwt`, its own JWKS cache).
+
+### Key rotation
+
+`POST /admin/rotate` creates a new KMS key and moves each key through a
+small state machine (`internal/issuer/keyring`):
+
+```text
+next ──(publish lead)──▶ current ──(next activates)──▶ retiring ──(token TTL + 30 s)──▶ dropped
+published only           signs + published            published only                  gone
+```
+
+A verifier may cache JWKS for half the publish lead (`Cache-Control`), so
+every verifier has a new key before the first token signed with it. The old
+key stays published until every token it signed has expired. Defaults:
+lead 10 min, retire 5 min 30 s. Rotation state is kept in memory, so a
+restart signs with the configured key again; production would persist it.
+
+### Revocation
+
+- `POST /revoke` (RFC 7009): a partner revokes its own token
+  (`private_key_jwt`); other clients' tokens are refused, unknown tokens
+  are a silent 200.
+- `POST /admin/partners/{id}/suspend` (and `/resume`): no new tokens, and
+  every token issued before the suspension is revoked.
+- Both write the Redis denylist (kept until the token would expire anyway)
+  and publish on `warden.revocations`. policy-api keeps a local copy fed by
+  pub/sub, re-synced every 30 s, so checking it costs no network call.
+  Measured propagation in the integration test: a few milliseconds.
+- `POST /introspect` (RFC 7662) answers `active` from signature, expiry,
+  denylist and partner status, for resource servers (HTTP Basic). policy-api
+  introspects online only for claim approvals above 10 000 €, routed by
+  issuer: Keycloak tokens to Keycloak, partner tokens to partner-sts.
+
+Admin endpoints listen on `127.0.0.1:9083` only; production would put them
+behind mTLS or an identity-aware proxy.
 
 ## Repository layout
 
@@ -224,9 +259,11 @@ internal/
   policy/
     domain/           entities and rules, pure Go
     app/              use cases and the store interfaces they need
-    adapters/         grpcapi, httpapi (driving); pgstore, memstore (driven)
+    adapters/         grpcapi, httpapi (driving); pgstore, memstore, introspect (driven)
   authz/              authorization engine: Decide, reasons, step-up challenge
   issuer/             token minting (compact JWS) over a Signer
+    keyring/          signing-key rotation state machine
+  revocation/         denylist set, Redis store, pub/sub subscriber
   kms/                KMS and local ES256 signers, DER → JOSE conversion
   sts/
     clientauth/       private_key_jwt assertion verification

@@ -39,3 +39,18 @@ func FromContext(ctx context.Context) (Principal, bool) {
 	p, ok := ctx.Value(principalKey{}).(Principal)
 	return p, ok
 }
+
+type rawTokenKey struct{}
+
+// WithRawToken stores the validated bearer token. The authn adapters call
+// it after a successful Validate, because online introspection (RFC 7662)
+// needs the token itself. Never log what RawTokenFrom returns.
+func WithRawToken(ctx context.Context, raw string) context.Context {
+	return context.WithValue(ctx, rawTokenKey{}, raw)
+}
+
+// RawTokenFrom returns the token stored by WithRawToken.
+func RawTokenFrom(ctx context.Context) (string, bool) {
+	raw, ok := ctx.Value(rawTokenKey{}).(string)
+	return raw, ok && raw != ""
+}

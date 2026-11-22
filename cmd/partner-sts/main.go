@@ -21,7 +21,9 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/aamirlatif1/warden/internal/issuer"
+	"github.com/aamirlatif1/warden/internal/issuer/keyring"
 	"github.com/aamirlatif1/warden/internal/kms"
+	"github.com/aamirlatif1/warden/internal/revocation"
 	"github.com/aamirlatif1/warden/internal/sts/adapters/httpapi"
 	"github.com/aamirlatif1/warden/internal/sts/adapters/pgstore"
 	"github.com/aamirlatif1/warden/internal/sts/adapters/redisreplay"
@@ -29,8 +31,14 @@ import (
 	"github.com/aamirlatif1/warden/internal/sts/clientauth"
 )
 
+// tokenTTL is the lifetime of every access token partner-sts issues.
+const tokenTTL = 5 * time.Minute
+
 type cfg struct {
-	addr, issuer, audience string
+	addr, adminAddr        string
+	issuer, audience       string
+	publishLead            time.Duration
+	introspectSecret       string
 	signer                 string // kms | local
 	kmsKeyID, kmsEndpoint  string
 	region, localKeyFile   string
@@ -39,22 +47,35 @@ type cfg struct {
 
 func loadConfig() cfg {
 	return cfg{
-		addr:         env("WARDEN_STS_ADDR", ":8083"),
-		issuer:       env("WARDEN_STS_ISSUER", "http://localhost:8083"),
-		audience:     env("WARDEN_API_AUDIENCE", "policy-api"),
-		signer:       env("WARDEN_SIGNER", "kms"),
-		kmsKeyID:     env("WARDEN_KMS_KEY_ID", "alias/warden-sts"),
-		kmsEndpoint:  env("WARDEN_KMS_ENDPOINT", "http://localhost:4566"), // LocalStack; empty = real AWS
-		region:       env("AWS_REGION", "eu-central-1"),
-		localKeyFile: env("WARDEN_LOCAL_KEY_FILE", ".local/sts-signing.key.pem"),
-		databaseURL:  env("WARDEN_DATABASE_URL", "postgres://warden:warden@localhost:5434/warden?sslmode=disable"),
-		redisAddr:    env("WARDEN_REDIS_ADDR", "localhost:6379"),
+		addr:        env("WARDEN_STS_ADDR", ":8083"),
+		adminAddr:   env("WARDEN_STS_ADMIN_ADDR", "127.0.0.1:9083"),
+		issuer:      env("WARDEN_STS_ISSUER", "http://localhost:8083"),
+		audience:    env("WARDEN_API_AUDIENCE", "policy-api"),
+		publishLead: durationEnv("WARDEN_STS_PUBLISH_LEAD", 10*time.Minute),
+		// policy-api's credentials for /introspect; empty disables the endpoint.
+		introspectSecret: os.Getenv("WARDEN_STS_INTROSPECT_SECRET"),
+		signer:           env("WARDEN_SIGNER", "kms"),
+		kmsKeyID:         env("WARDEN_KMS_KEY_ID", "alias/warden-sts"),
+		kmsEndpoint:      env("WARDEN_KMS_ENDPOINT", "http://localhost:4566"), // LocalStack; empty = real AWS
+		region:           env("AWS_REGION", "eu-central-1"),
+		localKeyFile:     env("WARDEN_LOCAL_KEY_FILE", ".local/sts-signing.key.pem"),
+		databaseURL:      env("WARDEN_DATABASE_URL", "postgres://warden:warden@localhost:5434/warden?sslmode=disable"),
+		redisAddr:        env("WARDEN_REDIS_ADDR", "localhost:6379"),
 	}
 }
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func durationEnv(k string, def time.Duration) time.Duration {
+	if v := os.Getenv(k); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
 	}
 	return def
 }
@@ -72,11 +93,23 @@ func run(log *slog.Logger) error {
 	defer stop()
 	c := loadConfig()
 
-	signer, err := newSigner(ctx, c)
+	// ---- keys: KMS (or local) signer inside the rotation state machine ----
+	signer, factory, err := newSigner(ctx, c)
 	if err != nil {
 		return err
 	}
-	minter, err := issuer.New(issuer.Config{Issuer: c.issuer, Audience: c.audience, Keys: issuer.SingleKey{S: signer}})
+	// ADR-004: a new key is published publishLead before it signs, and JWKS
+	// is cacheable for half of that, so every verifier has it in time. An
+	// old key stays published for one token lifetime (+ leeway) after.
+	ring, err := keyring.New(keyring.Config{
+		PublishLead: c.publishLead,
+		RetireAfter: tokenTTL + 30*time.Second,
+		Factory:     factory,
+	}, signer)
+	if err != nil {
+		return err
+	}
+	minter, err := issuer.New(issuer.Config{Issuer: c.issuer, Audience: c.audience, TTL: tokenTTL, Keys: ring})
 	if err != nil {
 		return err
 	}
@@ -84,6 +117,7 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// ---- storage ----
 	store, err := pgstore.Open(c.databaseURL)
 	if err != nil {
 		return err
@@ -92,10 +126,10 @@ func run(log *slog.Logger) error {
 	if err := store.Migrate(ctx); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-
 	rdb := redis.NewClient(&redis.Options{Addr: c.redisAddr})
 	defer func() { _ = rdb.Close() }()
 
+	// ---- use cases ----
 	verifier, err := clientauth.NewVerifier(clientauth.Config{
 		Audience: c.issuer, // rfc7523bis: the assertion's aud is our issuer identifier
 		Clients:  store,
@@ -104,26 +138,47 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("client auth config: %w", err)
 	}
-
 	tokens := app.NewTokenService(verifier, store, minter, log)
+	lifecycle := app.NewLifecycle(verifier, minter, revocation.NewStore(rdb), store, ring, log)
 
+	introspectors := map[string]string{}
+	if c.introspectSecret != "" {
+		introspectors["policy-api"] = c.introspectSecret
+	}
+
+	// ---- HTTP: public listener + loopback-only admin listener ----
 	gin.SetMode(gin.ReleaseMode)
-	srv := &http.Server{
-		Addr:              c.addr,
-		Handler:           httpapi.NewRouter(httpapi.Config{Issuer: c.issuer, JWKSMaxAge: 300}, tokens, minter, log),
+	public := &http.Server{
+		Addr: c.addr,
+		Handler: httpapi.NewRouter(httpapi.Config{
+			Issuer:               c.issuer,
+			JWKSMaxAge:           int((c.publishLead / 2).Seconds()),
+			IntrospectionClients: introspectors,
+		}, httpapi.Services{Tokens: tokens, Lifecycle: lifecycle, Keys: minter}, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
-	errc := make(chan error, 1)
-	go func() {
-		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			errc <- err
-		}
-	}()
-	log.Info("partner-sts listening", "addr", c.addr, "issuer", c.issuer, "signer", c.signer, "kid", signer.KeyID())
+	admin := &http.Server{
+		Addr:              c.adminAddr,
+		Handler:           httpapi.NewAdminRouter(lifecycle, log),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second, // a KMS CreateKey can be slow
+	}
+	errc := make(chan error, 2)
+	for _, s := range []*http.Server{public, admin} {
+		go func() {
+			if err := s.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				errc <- err
+			}
+		}()
+	}
+	log.Info("partner-sts listening",
+		"addr", c.addr, "admin", c.adminAddr, "issuer", c.issuer, "signer", c.signer,
+		"kid", signer.KeyID(), "publish_lead", c.publishLead.String(), "introspection", c.introspectSecret != "")
 
 	select {
 	case <-ctx.Done():
@@ -132,13 +187,19 @@ func run(log *slog.Logger) error {
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	_ = admin.Shutdown(shutdownCtx)
+	return public.Shutdown(shutdownCtx)
 }
 
-func newSigner(ctx context.Context, c cfg) (issuer.Signer, error) {
+// newSigner returns the initial signing key and the factory that creates
+// rotated ones. Rotation state is in memory: after a restart the STS signs
+// with the configured key again (ADR-004 material: persist the ring, or
+// move the KMS alias when a key activates).
+func newSigner(ctx context.Context, c cfg) (issuer.Signer, keyring.KeyFactory, error) {
 	switch c.signer {
 	case "local":
-		return kms.LoadOrCreateLocalSigner(c.localKeyFile)
+		s, err := kms.LoadOrCreateLocalSigner(c.localKeyFile)
+		return s, kms.LocalFactory{}, err
 	case "kms":
 		opts := []func(*config.LoadOptions) error{config.WithRegion(c.region)}
 		if c.kmsEndpoint != "" && os.Getenv("AWS_ACCESS_KEY_ID") == "" {
@@ -147,7 +208,7 @@ func newSigner(ctx context.Context, c cfg) (issuer.Signer, error) {
 		}
 		awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		client := awskms.NewFromConfig(awsCfg, func(o *awskms.Options) {
 			if c.kmsEndpoint != "" {
@@ -156,10 +217,10 @@ func newSigner(ctx context.Context, c cfg) (issuer.Signer, error) {
 		})
 		s, err := kms.NewKMSSigner(ctx, client, c.kmsKeyID)
 		if err != nil {
-			return nil, fmt.Errorf("%w (run `make kms-key`, or set WARDEN_SIGNER=local)", err)
+			return nil, nil, fmt.Errorf("%w (run `make kms-key`, or set WARDEN_SIGNER=local)", err)
 		}
-		return s, nil
+		return s, kms.KMSFactory{API: client, Description: "warden partner-sts signing key (rotated)"}, nil
 	default:
-		return nil, fmt.Errorf("WARDEN_SIGNER must be kms or local, got %q", c.signer)
+		return nil, nil, fmt.Errorf("WARDEN_SIGNER must be kms or local, got %q", c.signer)
 	}
 }

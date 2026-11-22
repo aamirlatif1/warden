@@ -114,12 +114,27 @@ func (s *staticKeys) Key(_ context.Context, kid string) (jose.JSONWebKey, error)
 	return key, nil
 }
 
-type denylist map[string]bool
+// denylist revokes jti "revoked-jti" from any issuer, and every token of
+// client "suspended-client" issued at or before now-1m.
+type denylist struct{}
 
-func (d denylist) Revoked(jti string) bool { return d[jti] }
+func (denylist) Revoked(t authn.TokenRef) bool {
+	if t.JTI == "revoked-jti" {
+		return true
+	}
+	if t.ClientID == "suspended-client" {
+		return t.IssuedAt.IsZero() || !t.IssuedAt.After(now.Add(-time.Minute))
+	}
+	return false
+}
+
+// recordingDenylist records what the validator asked.
+type recordingDenylist struct{ got []authn.TokenRef }
+
+func (r *recordingDenylist) Revoked(t authn.TokenRef) bool { r.got = append(r.got, t); return false }
 
 // newTestValidator trusts Keycloak, partner-sts and Cognito, each with
-// only its own key, and revokes jti "revoked-jti".
+// only its own key, with the denylist above.
 func newTestValidator(t testing.TB) *authn.Validator {
 	t.Helper()
 	ks := k(t)
@@ -129,7 +144,7 @@ func newTestValidator(t testing.TB) *authn.Validator {
 			{Profile: authn.PartnerSTSProfile(stsIss, audience), Keys: newStaticKeys(pubJWK(ks.sts, stsKid, jose.ES256))},
 			{Profile: authn.CognitoProfile(cognitoIss, cognitoApp), Keys: newStaticKeys(pubJWK(ks.cognito, cognitoKid, jose.RS256))},
 		},
-		Denylist: denylist{"revoked-jti": true},
+		Denylist: denylist{},
 		Now:      func() time.Time { return now },
 	})
 	if err != nil {

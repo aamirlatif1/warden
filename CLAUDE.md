@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-In progress (S0–S4 scaffolding done; hand-build bodies in `internal/authn`,
-`internal/authn/jwks`, `ginauth`, `grpcauth`, `authz.Decide` and
-`sts/clientauth` are the author's, still `TODO` stubs until written). Client
+In progress (S0–S5 scaffolding done; hand-build bodies in `internal/authn`,
+`internal/authn/jwks`, `ginauth`, `grpcauth`, `authz.Decide`,
+`sts/clientauth` and `issuer/keyring` are the author's, still `TODO` stubs
+until written). Client
 assertions use `aud` = STS issuer identifier only (rfc7523bis), a deliberate
 deviation from FR-4's "token endpoint URL". The source of truth is
 `REQUIREMENTS.md` (FR-1…FR-7, drills, ADRs, Definition of Done) and
@@ -107,6 +108,7 @@ Targets (`make help` lists what exists; `drills`, `demo*` come later):
 - `make test-db` — pgstore integration tests (Postgres `warden_test` database)
 - `make seed` — demo policies/claims owned by the Keycloak seed users' `sub`
 - `make kms-key`, `make sts-seed`, `make run-sts` — partner-sts setup (keys in gitignored `.local/`)
+- `make rotate-under-load` — rotation drill (`make run-sts STS_PUBLISH_LEAD=20s`)
 
 Single test: `go test -race -run TestName ./internal/authn/`.
 
@@ -123,6 +125,9 @@ Single Go module, three services plus Keycloak:
   No network call on the hot path: JWKS is cached, revocation is a local
   in-memory denylist fed by Redis pub/sub (`warden.revocations`); online
   introspection only for high-risk actions (claims > 10 000 €).
+  `authn.Denylist.Revoked(TokenRef{Issuer, JTI, ClientID, IssuedAt})` covers
+  single tokens and client-level cut-offs (partner suspension); the authn
+  adapters also store the raw token (`authn.WithRawToken`) for introspection.
 - **`cmd/bff`** (:8082) — OIDC auth code + PKCE against Keycloak; tokens live
   server-side in Redis (AES-GCM), browser gets only `__Host-sid`. Handles
   refresh rotation, CSRF, step-up (on RFC 9470 `insufficient_user_authentication`

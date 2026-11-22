@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,8 +15,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-jose/go-jose/v4"
 
+	"github.com/aamirlatif1/warden/internal/issuer/keyring"
 	"github.com/aamirlatif1/warden/internal/sts/adapters/httpapi"
 	"github.com/aamirlatif1/warden/internal/sts/app"
+	"github.com/aamirlatif1/warden/internal/sts/domain"
 )
 
 type stubTokens struct {
@@ -34,10 +37,31 @@ func (stubKeys) JWKS() jose.JSONWebKeySet {
 	return jose.JSONWebKeySet{Keys: []jose.JSONWebKey{}}
 }
 
-func newRouter(tokens *stubTokens) http.Handler {
-	gin.SetMode(gin.TestMode)
-	return httpapi.NewRouter(httpapi.Config{Issuer: "http://localhost:8083", JWKSMaxAge: 300}, tokens, stubKeys{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+type stubLifecycle struct {
+	revoked    string
+	revokeErr  error
+	introspect app.Introspection
+	introErr   error
 }
+
+func (s *stubLifecycle) Revoke(_ context.Context, r app.RevokeRequest) error {
+	s.revoked = r.Token
+	return s.revokeErr
+}
+
+func (s *stubLifecycle) Introspect(context.Context, string) (app.Introspection, error) {
+	return s.introspect, s.introErr
+}
+
+func newRouterWith(tokens *stubTokens, lc *stubLifecycle) http.Handler {
+	gin.SetMode(gin.TestMode)
+	return httpapi.NewRouter(
+		httpapi.Config{Issuer: "http://localhost:8083", JWKSMaxAge: 300, IntrospectionClients: map[string]string{"policy-api": "s3cret"}},
+		httpapi.Services{Tokens: tokens, Lifecycle: lc, Keys: stubKeys{}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func newRouter(tokens *stubTokens) http.Handler { return newRouterWith(tokens, &stubLifecycle{}) }
 
 func form(kv ...string) string {
 	v := url.Values{}
@@ -137,5 +161,81 @@ func TestTokenRequestErrors(t *testing.T) {
 				t.Fatal("assertion was read from the query string")
 			}
 		})
+	}
+}
+
+func TestRevokeEndpoint(t *testing.T) {
+	lc := &stubLifecycle{}
+	h := newRouterWith(&stubTokens{}, lc)
+	w := post(h, "/revoke", formCT, form("token", "tok", "client_assertion_type", "x", "client_assertion", "a"))
+	if w.Code != 200 || lc.revoked != "tok" || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("%d %q", w.Code, lc.revoked)
+	}
+	lc.revokeErr = &app.OAuthError{Code: app.ErrUnauthorizedClient, Description: "x"}
+	if w := post(h, "/revoke", formCT, form("token", "tok")); w.Code != 403 {
+		t.Fatalf("unauthorized_client: %d", w.Code)
+	}
+}
+
+func TestIntrospectEndpoint(t *testing.T) {
+	lc := &stubLifecycle{introspect: app.Introspection{Active: true, ClientID: "shopr"}}
+	h := newRouterWith(&stubTokens{}, lc)
+	do := func(user, pass string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/introspect", strings.NewReader(form("token", "tok")))
+		req.Header.Set("Content-Type", formCT)
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+	if w := do("policy-api", "s3cret"); w.Code != 200 || !strings.Contains(w.Body.String(), `"active":true`) {
+		t.Fatalf("authorized: %d %s", w.Code, w.Body)
+	}
+	for name, creds := range map[string][2]string{"no auth": {"", ""}, "wrong secret": {"policy-api", "nope"}, "unknown client": {"shopr", "s3cret"}} {
+		if w := do(creds[0], creds[1]); w.Code != 401 || strings.Contains(w.Body.String(), "active") {
+			t.Errorf("%s: %d %s", name, w.Code, w.Body)
+		}
+	}
+	lc.introErr = errors.New("redis down")
+	if w := do("policy-api", "s3cret"); w.Code != 503 {
+		t.Fatalf("store down: %d (must not answer active=false)", w.Code)
+	}
+}
+
+type stubAdmin struct{ rotateErr, partnerErr error }
+
+func (s stubAdmin) Rotate(context.Context) (keyring.KeyInfo, error) {
+	return keyring.KeyInfo{KID: "k2", State: keyring.StateNext}, s.rotateErr
+}
+func (stubAdmin) Keys() []keyring.KeyInfo {
+	return []keyring.KeyInfo{{KID: "k1", State: keyring.StateCurrent}}
+}
+func (s stubAdmin) SuspendPartner(context.Context, string) error { return s.partnerErr }
+func (s stubAdmin) ResumePartner(context.Context, string) error  { return s.partnerErr }
+
+func TestAdminRouter(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	req := func(h http.Handler, method, path string) int {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(method, path, nil))
+		return w.Code
+	}
+	h := httpapi.NewAdminRouter(stubAdmin{}, quiet)
+	if c := req(h, "GET", "/admin/keys"); c != 200 {
+		t.Errorf("keys: %d", c)
+	}
+	if c := req(h, "POST", "/admin/rotate"); c != 202 {
+		t.Errorf("rotate: %d", c)
+	}
+	if c := req(h, "POST", "/admin/partners/shopr/suspend"); c != 204 {
+		t.Errorf("suspend: %d", c)
+	}
+	if c := req(httpapi.NewAdminRouter(stubAdmin{rotateErr: keyring.ErrRotationInProgress}, quiet), "POST", "/admin/rotate"); c != 409 {
+		t.Errorf("rotate in progress: %d", c)
+	}
+	if c := req(httpapi.NewAdminRouter(stubAdmin{partnerErr: domain.ErrNotFound}, quiet), "POST", "/admin/partners/x/resume"); c != 404 {
+		t.Errorf("unknown partner: %d", c)
 	}
 }

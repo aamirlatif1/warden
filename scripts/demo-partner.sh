@@ -47,3 +47,40 @@ code=$(quote shopr); [[ $code == 201 ]] && ok "quote for shopr: 201" || fail "qu
 
 say "5. D5: cross-tenant quote (partner_id=nordbank)"
 code=$(quote nordbank); [[ $code == 403 ]] && ok "quote for nordbank: 403" || fail "quote for nordbank: $code, want 403"
+
+ADMIN_URL=${ADMIN_URL:-http://127.0.0.1:9083}
+
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
+
+# wait_until_401 TOKEN: polls policy-api every 10 ms; prints the elapsed ms.
+wait_until_401() {
+  local tok=$1 start end code
+  start=$(now_ms)
+  for _ in $(seq 1 300); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$API_URL/v1/quotes" -X POST -H "Authorization: Bearer $tok" \
+      -H 'Content-Type: application/json' -d '{"partner_id":"shopr","product":"phone","insured_value":{"amount_minor":100,"currency":"EUR"}}')
+    if [[ $code == 401 ]]; then
+      end=$(now_ms)
+      echo $((end - start)); return 0
+    fi
+    sleep 0.01
+  done
+  return 1
+}
+
+say "6. D13: Shopr revokes its own token (RFC 7009)"
+token=$("${CLI[@]}" token -scope "quotes:write")
+"${CLI[@]}" revoke -token "$token"
+ms=$(wait_until_401 "$token") && ok "revoked token rejected by policy-api after ${ms} ms (target < 1000)" || fail "revoked token still accepted after 3 s"
+
+say "7. D13: operator suspends Shopr"
+token=$("${CLI[@]}" token -scope "quotes:write")
+curl -sf -X POST "$ADMIN_URL/admin/partners/shopr/suspend"
+ms=$(wait_until_401 "$token") && ok "existing token rejected after suspension in ${ms} ms" || fail "token still accepted after suspension"
+if "${CLI[@]}" token >/dev/null 2>&1; then fail "suspended partner got a new token"; else ok "suspended partner cannot get a token (invalid_client)"; fi
+curl -sf -X POST "$ADMIN_URL/admin/partners/shopr/resume"
+sleep 1.1 # iat has 1 s resolution: the next token must be issued after the cut-off
+token=$("${CLI[@]}" token -scope "quotes:write")
+code=$(quote shopr); [[ $code == 201 ]] && ok "after resume, a new token works: 201" || fail "after resume: $code"
+
+echo; echo "Key rotation under load: make rotate-under-load (see README)."

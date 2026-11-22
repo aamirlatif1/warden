@@ -4,6 +4,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -23,11 +25,26 @@ type KeySet interface {
 	JWKS() jose.JSONWebKeySet
 }
 
+type LifecycleService interface {
+	Revoke(ctx context.Context, req app.RevokeRequest) error
+	Introspect(ctx context.Context, raw string) (app.Introspection, error)
+}
+
+// Services are the use cases behind the public router.
+type Services struct {
+	Tokens    TokenService
+	Lifecycle LifecycleService
+	Keys      KeySet
+}
+
 type Config struct {
 	Issuer        string // e.g. http://localhost:8083
 	JWKSMaxAge    int    // seconds, Cache-Control on /jwks.json (rotation lead time is 2x this)
 	MaxBodyBytes  int64  // token request body cap
 	SupportedAlgs []string
+	// IntrospectionClients are the resource servers allowed to call
+	// /introspect, as client_id → secret (HTTP Basic). Empty disables it.
+	IntrospectionClients map[string]string
 }
 
 // Metadata is the RFC 8414 / OIDC discovery document.
@@ -38,10 +55,13 @@ type Metadata struct {
 	GrantTypesSupported          []string `json:"grant_types_supported"`
 	TokenEndpointAuthMethods     []string `json:"token_endpoint_auth_methods_supported"`
 	TokenEndpointAuthSigningAlgs []string `json:"token_endpoint_auth_signing_alg_values_supported"`
+	RevocationEndpoint           string   `json:"revocation_endpoint"`
+	IntrospectionEndpoint        string   `json:"introspection_endpoint"`
 	ResponseTypesSupported       []string `json:"response_types_supported"`
 }
 
-func NewRouter(cfg Config, tokens TokenService, keys KeySet, log *slog.Logger) *gin.Engine {
+func NewRouter(cfg Config, svc Services, log *slog.Logger) *gin.Engine {
+	tokens, keys := svc.Tokens, svc.Keys
 	if cfg.JWKSMaxAge == 0 {
 		cfg.JWKSMaxAge = 300
 	}
@@ -58,6 +78,8 @@ func NewRouter(cfg Config, tokens TokenService, keys KeySet, log *slog.Logger) *
 		GrantTypesSupported:          []string{"client_credentials"},
 		TokenEndpointAuthMethods:     []string{"private_key_jwt"},
 		TokenEndpointAuthSigningAlgs: cfg.SupportedAlgs,
+		RevocationEndpoint:           cfg.Issuer + "/revoke",
+		IntrospectionEndpoint:        cfg.Issuer + "/introspect",
 		// Required by RFC 8414 but meaningless here: no authorization
 		// endpoint, so no response types. "token" would advertise implicit.
 		ResponseTypesSupported: []string{},
@@ -87,24 +109,8 @@ func NewRouter(cfg Config, tokens TokenService, keys KeySet, log *slog.Logger) *
 		// RFC 6749 §5.1: token responses must not be cached.
 		c.Header("Cache-Control", "no-store")
 		c.Header("Pragma", "no-cache")
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cfg.MaxBodyBytes)
-
-		if ct := c.ContentType(); ct != "application/x-www-form-urlencoded" {
-			oauthError(c, &app.OAuthError{Code: app.ErrInvalidRequest, Description: "body must be application/x-www-form-urlencoded"})
+		if !readForm(c, cfg.MaxBodyBytes, "grant_type", "client_assertion", "client_assertion_type", "client_id", "scope") {
 			return
-		}
-		if err := c.Request.ParseForm(); err != nil {
-			oauthError(c, &app.OAuthError{Code: app.ErrInvalidRequest, Description: "malformed form body"})
-			return
-		}
-		// Credentials only from the body, never the query string (RFC 6749
-		// §2.3.1): PostForm reads the body only. Repeated parameters are
-		// ambiguous and rejected (RFC 6749 §3.2).
-		for _, p := range []string{"grant_type", "client_assertion", "client_assertion_type", "client_id", "scope"} {
-			if len(c.Request.PostForm[p]) > 1 {
-				oauthError(c, &app.OAuthError{Code: app.ErrInvalidRequest, Description: "repeated parameter: " + p})
-				return
-			}
 		}
 		resp, err := tokens.Token(c.Request.Context(), app.TokenRequest{
 			GrantType:           c.PostForm("grant_type"),
@@ -124,7 +130,80 @@ func NewRouter(cfg Config, tokens TokenService, keys KeySet, log *slog.Logger) *
 			"scope":        resp.Scope,
 		})
 	})
+	// RFC 7009. Always 200 for a well-formed, authenticated request, even
+	// for an unknown token.
+	r.POST("/revoke", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		if !readForm(c, cfg.MaxBodyBytes, "token", "token_type_hint", "client_assertion", "client_assertion_type", "client_id") {
+			return
+		}
+		err := svc.Lifecycle.Revoke(c.Request.Context(), app.RevokeRequest{
+			ClientAssertionType: c.PostForm("client_assertion_type"),
+			ClientAssertion:     c.PostForm("client_assertion"),
+			ClientID:            c.PostForm("client_id"),
+			Token:               c.PostForm("token"),
+		})
+		if err != nil {
+			oauthError(c, err)
+			return
+		}
+		c.Status(http.StatusOK)
+	})
+
+	// RFC 7662, for resource servers (HTTP Basic).
+	r.POST("/introspect", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		if !resourceServerAuth(c, cfg.IntrospectionClients) {
+			c.Header("WWW-Authenticate", `Basic realm="warden-introspection"`)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": app.ErrInvalidClient})
+			return
+		}
+		if !readForm(c, cfg.MaxBodyBytes, "token", "token_type_hint") {
+			return
+		}
+		resp, err := svc.Lifecycle.Introspect(c.Request.Context(), c.PostForm("token"))
+		if err != nil {
+			log.ErrorContext(c.Request.Context(), "introspection failed", "err", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": app.ErrServerError})
+			return
+		}
+		c.JSON(http.StatusOK, resp)
+	})
 	return r
+}
+
+// readForm caps the body, requires a form content type, parses the body
+// (never the query string: RFC 6749 §2.3.1) and rejects repeated
+// parameters (RFC 6749 §3.2). It writes the error response itself.
+func readForm(c *gin.Context, maxBytes int64, single ...string) bool {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	if c.ContentType() != "application/x-www-form-urlencoded" {
+		oauthError(c, &app.OAuthError{Code: app.ErrInvalidRequest, Description: "body must be application/x-www-form-urlencoded"})
+		return false
+	}
+	if err := c.Request.ParseForm(); err != nil {
+		oauthError(c, &app.OAuthError{Code: app.ErrInvalidRequest, Description: "malformed form body"})
+		return false
+	}
+	for _, p := range single {
+		if len(c.Request.PostForm[p]) > 1 {
+			oauthError(c, &app.OAuthError{Code: app.ErrInvalidRequest, Description: "repeated parameter: " + p})
+			return false
+		}
+	}
+	return true
+}
+
+// resourceServerAuth checks HTTP Basic credentials in constant time
+// (comparing SHA-256 digests, so lengths don't leak either).
+func resourceServerAuth(c *gin.Context, clients map[string]string) bool {
+	id, secret, ok := c.Request.BasicAuth()
+	if !ok || len(clients) == 0 {
+		return false
+	}
+	want, known := clients[id]
+	a, b := sha256.Sum256([]byte(secret)), sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1 && known && want != ""
 }
 
 // oauthError writes an RFC 6749 §5.2 error. invalid_client is 400 here,
@@ -136,8 +215,11 @@ func oauthError(c *gin.Context, err error) {
 		oe = &app.OAuthError{Code: app.ErrServerError, Description: "temporarily unavailable"}
 	}
 	status := http.StatusBadRequest
-	if oe.Code == app.ErrServerError {
+	switch oe.Code {
+	case app.ErrServerError:
 		status = http.StatusInternalServerError
+	case app.ErrUnauthorizedClient:
+		status = http.StatusForbidden
 	}
 	c.JSON(status, gin.H{"error": oe.Code, "error_description": oe.Description})
 }

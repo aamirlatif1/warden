@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
 	policyv1 "github.com/aamirlatif1/warden/gen/warden/policy/v1"
@@ -25,8 +26,10 @@ import (
 	"github.com/aamirlatif1/warden/internal/authn/jwks"
 	"github.com/aamirlatif1/warden/internal/policy/adapters/grpcapi"
 	"github.com/aamirlatif1/warden/internal/policy/adapters/httpapi"
+	"github.com/aamirlatif1/warden/internal/policy/adapters/introspect"
 	"github.com/aamirlatif1/warden/internal/policy/adapters/pgstore"
 	"github.com/aamirlatif1/warden/internal/policy/app"
+	"github.com/aamirlatif1/warden/internal/revocation"
 )
 
 type config struct {
@@ -38,6 +41,11 @@ type config struct {
 	stsIssuer       string
 	stsJWKSURL      string
 	databaseURL     string
+	redisAddr       string
+	// RFC 7662 credentials (policy-api's client secret at each issuer);
+	// empty disables introspection for that issuer.
+	keycloakIntrospectSecret string
+	stsIntrospectSecret      string
 }
 
 func loadConfig() config {
@@ -52,6 +60,10 @@ func loadConfig() config {
 		stsIssuer:       stsIssuer,
 		stsJWKSURL:      env("WARDEN_STS_JWKS_URL", stsIssuer+"/jwks.json"),
 		databaseURL:     env("WARDEN_DATABASE_URL", "postgres://warden:warden@localhost:5434/warden?sslmode=disable"),
+		redisAddr:       env("WARDEN_REDIS_ADDR", "localhost:6379"),
+
+		keycloakIntrospectSecret: os.Getenv("WARDEN_KEYCLOAK_INTROSPECT_SECRET"),
+		stsIntrospectSecret:      os.Getenv("WARDEN_STS_INTROSPECT_SECRET"),
 	}
 }
 
@@ -80,11 +92,20 @@ func run(log *slog.Logger) error {
 	kcKeys := startJWKS(ctx, log, "keycloak", cfg.keycloakJWKSURL)
 	stsKeys := startJWKS(ctx, log, "partner-sts", cfg.stsJWKSURL)
 
+	// Revocation: a local set fed by Redis pub/sub, so the hot path makes
+	// no network call. If Redis is down the set keeps its last state:
+	// tokens are short-lived, and high-risk calls are introspected online.
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
+	defer func() { _ = rdb.Close() }()
+	denylist := revocation.NewSet(nil)
+	go revocation.NewSubscriber(rdb, denylist, log).Run(ctx)
+
 	validator, err := authn.NewValidator(authn.Config{
 		Issuers: []authn.Issuer{
 			{Profile: authn.KeycloakProfile(cfg.keycloakIssuer, cfg.audience), Keys: kcKeys},
 			{Profile: authn.PartnerSTSProfile(cfg.stsIssuer, cfg.audience), Keys: stsKeys},
 		},
+		Denylist: denylist,
 	})
 	if err != nil {
 		return fmt.Errorf("authn config: %w", err)
@@ -102,14 +123,12 @@ func run(log *slog.Logger) error {
 
 	// ---- app ----
 	svc := app.NewService(app.Deps{
-		Policies: store,
-		Quotes:   store,
-		Claims:   store,
-		Limits:   store,
-		Tx:       store,
-		// S5: introspection client for partner-sts / Keycloak. Until then,
-		// approvals above 10 000 EUR fail closed (503).
-		Introspector: nil,
+		Policies:     store,
+		Quotes:       store,
+		Claims:       store,
+		Limits:       store,
+		Tx:           store,
+		Introspector: newIntrospector(cfg, log),
 		Log:          log,
 	})
 
@@ -167,4 +186,26 @@ func startJWKS(ctx context.Context, log *slog.Logger, name, url string) *jwks.Ca
 	}
 	go c.Run(ctx)
 	return c
+}
+
+// newIntrospector routes RFC 7662 calls by token issuer. With no
+// credentials configured it returns nil, and approvals above 10 000 EUR
+// fail closed (503).
+func newIntrospector(cfg config, log *slog.Logger) app.Introspector {
+	eps := map[string]introspect.Endpoint{}
+	if cfg.keycloakIntrospectSecret != "" {
+		eps[cfg.keycloakIssuer] = introspect.Endpoint{
+			URL:      cfg.keycloakIssuer + "/protocol/openid-connect/token/introspect",
+			ClientID: "policy-api",
+			Secret:   cfg.keycloakIntrospectSecret,
+		}
+	}
+	if cfg.stsIntrospectSecret != "" {
+		eps[cfg.stsIssuer] = introspect.Endpoint{URL: cfg.stsIssuer + "/introspect", ClientID: "policy-api", Secret: cfg.stsIntrospectSecret}
+	}
+	if len(eps) == 0 {
+		log.Warn("no introspection credentials: approvals above 10 000 EUR fail closed")
+		return nil
+	}
+	return introspect.New(eps, nil)
 }

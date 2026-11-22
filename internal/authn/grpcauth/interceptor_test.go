@@ -53,7 +53,9 @@ func TestUnaryServerInterceptor(t *testing.T) {
 			var seen authn.Principal
 			handler := func(ctx context.Context, _ any) (any, error) {
 				handlerCalled = true
-				seen, _ = authn.FromContext(ctx)
+				if raw, ok := authn.RawTokenFrom(ctx); ok && raw == goodToken {
+					seen, _ = authn.FromContext(ctx)
+				}
 				return "ok", nil
 			}
 			_, err := icpt(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/warden.policy.v1.PolicyService/GetPolicy"}, handler)
@@ -65,7 +67,7 @@ func TestUnaryServerInterceptor(t *testing.T) {
 				t.Fatalf("handler called = %v", handlerCalled)
 			}
 			if tc.wantCode == codes.OK && seen.Subject != "shopr" {
-				t.Fatalf("principal not in handler context: %+v", seen)
+				t.Fatalf("principal and raw token not in handler context: %+v", seen)
 			}
 			if err != nil && strings.Contains(status.Convert(err).Message(), "forged.token.sig") {
 				t.Fatalf("status message leaks the token: %v", err)

@@ -26,10 +26,16 @@ DATABASE_URL          ?= postgres://warden:warden@localhost:5434/warden?sslmode=
 TEST_DATABASE_URL     ?= postgres://warden:warden@localhost:5434/warden_test?sslmode=disable
 # Synthetic dev password from infra/live/local/env.hcl.
 ANNA_PASSWORD         ?= anna-dev-password
+# Dev-only shared secret: policy-api's credentials at partner-sts /introspect.
+STS_INTROSPECT_SECRET ?= dev-only-introspection-secret
+# How long a new STS key is published before it signs (ADR-004). 10m by
+# default; use e.g. STS_PUBLISH_LEAD=20s for the rotation demo.
+STS_PUBLISH_LEAD      ?= 10m
 
 .PHONY: help up down clean tools infra infra-plan infra-check check-s1 \
 	proto-tools proto proto-lint test bench run-api check-s2 \
-	test-db seed check-s3 kms-key partner-keys sts-seed run-sts demo-partner
+	test-db seed check-s3 kms-key partner-keys sts-seed run-sts demo-partner \
+	rotate-under-load
 
 help: ## List targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -81,7 +87,9 @@ test: ## go test -race ./...
 bench: ## authn benchmarks (target < 50 us/op warm)
 	go test -run '^$$' -bench . -benchmem ./internal/authn/
 
-run-api: ## Run policy-api on the host (gRPC :9090, REST :8081) against local Keycloak
+run-api: tools ## Run policy-api (gRPC :9090, REST :8081); reads its Keycloak introspection secret from Tofu
+	@WARDEN_KEYCLOAK_INTROSPECT_SECRET=$$($(TG_REALM) output -json client_secrets 2>/dev/null | jq -r '."policy-api" // empty') \
+	WARDEN_STS_INTROSPECT_SECRET='$(STS_INTROSPECT_SECRET)' \
 	go run ./cmd/policy-api
 
 check-s2: tools ## S2 acceptance: a real Keycloak token is accepted by policy-api (needs make up, make infra, make run-api)
@@ -101,7 +109,7 @@ test-db: ## Integration tests against compose Postgres, Redis and LocalStack KMS
 		|| $(COMPOSE) exec -T postgres psql -q -U postgres -c "CREATE DATABASE warden_test OWNER warden"
 	WARDEN_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' WARDEN_TEST_REDIS_ADDR=localhost:6379 \
 	WARDEN_TEST_KMS_ENDPOINT=http://localhost:4566 \
-		go test -race -count=1 ./internal/policy/adapters/pgstore/ ./internal/sts/adapters/... ./internal/kms/
+		go test -race -count=1 ./internal/policy/adapters/pgstore/ ./internal/sts/adapters/... ./internal/kms/ ./internal/revocation/
 
 seed: tools ## Load demo policies and claims, owned by the Keycloak seed users (needs make infra)
 	@set -euo pipefail; \
@@ -135,8 +143,12 @@ sts-seed: partner-keys ## Register partner Shopr (client_id shopr, tenant shopr)
 	WARDEN_DATABASE_URL='$(DATABASE_URL)' go run ./cmd/sts-seed -client-id shopr -partner-id shopr \
 		-name Shopr -scopes "quotes:read quotes:write" -jwks .local/shopr.jwks.json
 
-run-sts: ## Run partner-sts on :8083 (WARDEN_SIGNER=kms by default; local for a file key)
+run-sts: ## Run partner-sts on :8083, admin on 127.0.0.1:9083 (WARDEN_SIGNER=kms|local, STS_PUBLISH_LEAD=10m)
+	WARDEN_STS_PUBLISH_LEAD=$(STS_PUBLISH_LEAD) WARDEN_STS_INTROSPECT_SECRET='$(STS_INTROSPECT_SECRET)' \
 	go run ./cmd/partner-sts
 
-demo-partner: ## Partner M2M demo: token, D12 replay, quote, D5 cross-tenant 403 (needs run-sts + run-api)
+demo-partner: ## Partner demo: token, D12 replay, quote, D5 403, D13 revoke + suspend (needs run-sts + run-api)
 	./scripts/demo-partner.sh
+
+rotate-under-load: ## Rotate the STS key while a load loop runs; expects zero 401s (run-sts with STS_PUBLISH_LEAD=20s)
+	./scripts/rotate-under-load.sh

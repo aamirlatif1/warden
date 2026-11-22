@@ -81,23 +81,9 @@ func (s *TokenService) Token(ctx context.Context, req TokenRequest) (TokenRespon
 		return TokenResponse{}, oauthErr(ErrInvalidClient, "private_key_jwt client authentication required")
 	}
 
-	a, err := s.verifier.Verify(ctx, req.ClientAssertion)
+	a, err := authenticate(ctx, s.verifier, s.log, req.ClientAssertion, req.ClientID)
 	if err != nil {
-		reason := clientauth.ReasonOf(err)
-		var ce *clientauth.Error
-		claimed := ""
-		if errors.As(err, &ce) {
-			claimed = ce.ClientID
-		}
-		s.log.WarnContext(ctx, "client authentication failed", "reason", string(reason), "claimed_client_id", claimed)
-		if reason == clientauth.ReasonReplayUnavailable || reason == clientauth.ReasonInternal {
-			return TokenResponse{}, oauthErr(ErrServerError, "temporarily unavailable")
-		}
-		return TokenResponse{}, oauthErr(ErrInvalidClient, "client authentication failed")
-	}
-	if req.ClientID != "" && req.ClientID != a.ClientID {
-		s.log.WarnContext(ctx, "client authentication failed", "reason", "client_id_mismatch", "claimed_client_id", a.ClientID)
-		return TokenResponse{}, oauthErr(ErrInvalidClient, "client authentication failed")
+		return TokenResponse{}, err
 	}
 
 	p, err := s.partners.Partner(ctx, a.ClientID)
@@ -128,4 +114,28 @@ func (s *TokenService) Token(ctx context.Context, req TokenRequest) (TokenRespon
 		"jti", tok.JTI, "kid", tok.KeyID, "assertion_jti", a.JTI)
 
 	return TokenResponse{AccessToken: tok.Value, TokenType: "Bearer", ExpiresIn: s.ttl, Scope: strings.Join(scopes, " ")}, nil
+}
+
+// authenticate verifies a private_key_jwt assertion and, if the request
+// also names a client_id, that it matches. Shared by /token and /revoke.
+func authenticate(ctx context.Context, v AssertionVerifier, log *slog.Logger, assertion, clientID string) (clientauth.Assertion, error) {
+	a, err := v.Verify(ctx, assertion)
+	if err != nil {
+		reason := clientauth.ReasonOf(err)
+		var ce *clientauth.Error
+		claimed := ""
+		if errors.As(err, &ce) {
+			claimed = ce.ClientID
+		}
+		log.WarnContext(ctx, "client authentication failed", "reason", string(reason), "claimed_client_id", claimed)
+		if reason == clientauth.ReasonReplayUnavailable || reason == clientauth.ReasonInternal {
+			return clientauth.Assertion{}, oauthErr(ErrServerError, "temporarily unavailable")
+		}
+		return clientauth.Assertion{}, oauthErr(ErrInvalidClient, "client authentication failed")
+	}
+	if clientID != "" && clientID != a.ClientID {
+		log.WarnContext(ctx, "client authentication failed", "reason", "client_id_mismatch", "claimed_client_id", a.ClientID)
+		return clientauth.Assertion{}, oauthErr(ErrInvalidClient, "client authentication failed")
+	}
+	return a, nil
 }

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awskms "github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/go-jose/go-jose/v4"
@@ -97,5 +98,31 @@ func TestKMSSignerWithFake(t *testing.T) {
 	f.spec = types.KeySpecRsa2048
 	if _, err := NewKMSSigner(context.Background(), f, "alias/test"); err == nil {
 		t.Fatal("accepted a non-P-256 key spec")
+	}
+}
+
+func (f *fakeKMS) CreateKey(context.Context, *awskms.CreateKeyInput, ...func(*awskms.Options)) (*awskms.CreateKeyOutput, error) {
+	f.key, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	return &awskms.CreateKeyOutput{KeyMetadata: &types.KeyMetadata{KeyId: aws.String("new-key")}}, nil
+}
+
+func TestFactories(t *testing.T) {
+	ctx := context.Background()
+	f := &fakeKMS{spec: types.KeySpecEccNistP256}
+	s1, err := KMSFactory{API: f}.NewSigner(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := KMSFactory{API: f}.NewSigner(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s1.KeyID() == s2.KeyID() {
+		t.Fatal("two rotations produced the same kid")
+	}
+	l1, _ := LocalFactory{}.NewSigner(ctx)
+	l2, _ := LocalFactory{}.NewSigner(ctx)
+	if l1.KeyID() == l2.KeyID() {
+		t.Fatal("local factory reused a key")
 	}
 }

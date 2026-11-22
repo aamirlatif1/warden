@@ -17,7 +17,7 @@ import (
 //  6. Verify the signature.
 //  7. exp (required), nbf, iat with Leeway.
 //  8. Audience rule (aud / Cognito client_id + token_use), then typ.
-//  9. jti against the Denylist.
+//  9. Denylist.Revoked(TokenRef{iss, jti, client id, iat}).
 // 10. Map claims → Principal per profile.
 //
 // Every rejection is an *Error with a Reason (see errors.go).
@@ -29,9 +29,21 @@ type KeySource interface {
 	Key(ctx context.Context, kid string) (jose.JSONWebKey, error)
 }
 
-// Denylist reports revoked token IDs. Fed by Redis pub/sub from S5.
+// Denylist reports revoked tokens. Implemented by revocation.Set, fed by
+// Redis pub/sub. A token is revoked if its (issuer, jti) is listed, or if
+// its client is revoked for tokens issued at or before a cut-off (partner
+// suspension).
 type Denylist interface {
-	Revoked(jti string) bool
+	Revoked(t TokenRef) bool
+}
+
+// TokenRef identifies a token for the denylist. IssuedAt is the iat claim;
+// zero when absent (a client-level revocation then applies, fail closed).
+type TokenRef struct {
+	Issuer   string
+	JTI      string
+	ClientID string
+	IssuedAt time.Time
 }
 
 // Issuer pairs a profile with the keys it may sign with.

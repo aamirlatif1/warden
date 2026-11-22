@@ -4,6 +4,7 @@
 //	partnercli keygen    -key K -jwks J -kid shopr-1
 //	partnercli assertion -key K -kid shopr-1 -client-id shopr -sts URL
 //	partnercli token     -key K -kid shopr-1 -client-id shopr -sts URL [-scope S]
+//	partnercli revoke    -key K -kid shopr-1 -client-id shopr -sts URL -token T
 //
 // assertion and token print only the JWT to stdout, for scripts.
 package main
@@ -44,6 +45,8 @@ func main() {
 		err = assertionCmd(os.Args[2:])
 	case "token":
 		err = tokenCmd(os.Args[2:])
+	case "revoke":
+		err = revokeCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -54,7 +57,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: partnercli keygen|assertion|token [flags]")
+	fmt.Fprintln(os.Stderr, "usage: partnercli keygen|assertion|token|revoke [flags]")
 	os.Exit(2)
 }
 
@@ -122,8 +125,9 @@ func commonFlags(fs *flag.FlagSet) common {
 }
 
 type discovery struct {
-	Issuer        string `json:"issuer"`
-	TokenEndpoint string `json:"token_endpoint"`
+	Issuer             string `json:"issuer"`
+	TokenEndpoint      string `json:"token_endpoint"`
+	RevocationEndpoint string `json:"revocation_endpoint"`
 }
 
 func discover(ctx context.Context, base string) (discovery, error) {
@@ -232,5 +236,51 @@ func tokenCmd(args []string) error {
 		return fmt.Errorf("token: HTTP %d %s: %s", resp.StatusCode, body.Error, body.Description)
 	}
 	fmt.Println(body.AccessToken)
+	return nil
+}
+
+// revokeCmd revokes one of the client's own tokens (RFC 7009).
+func revokeCmd(args []string) error {
+	fs := flag.NewFlagSet("revoke", flag.ExitOnError)
+	c := commonFlags(fs)
+	token := fs.String("token", "", "access token to revoke (required)")
+	_ = fs.Parse(args)
+	if *token == "" {
+		return errors.New("-token is required")
+	}
+	key, err := loadKey(*c.key)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	d, err := discover(ctx, *c.sts)
+	if err != nil {
+		return err
+	}
+	if d.RevocationEndpoint == "" {
+		return errors.New("discovery: no revocation_endpoint")
+	}
+	a, err := signAssertion(key, *c.kid, *c.clientID, d.Issuer)
+	if err != nil {
+		return err
+	}
+	form := url.Values{
+		"token":                 {*token},
+		"token_type_hint":       {"access_token"},
+		"client_assertion_type": {clientauth.AssertionType},
+		"client_assertion":      {a},
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, d.RevocationEndpoint, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("revoke: HTTP %d: %s", resp.StatusCode, b)
+	}
+	fmt.Fprintln(os.Stderr, "revoked")
 	return nil
 }

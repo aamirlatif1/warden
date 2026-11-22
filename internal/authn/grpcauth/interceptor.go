@@ -21,7 +21,8 @@ type TokenValidator interface {
 //     codes.Unauthenticated.
 //   - Invalid token → codes.Unauthenticated; the message may carry the
 //     reason but never the token.
-//   - Success → handler runs with authn.WithPrincipal(ctx, p).
+//   - Success → handler runs with authn.WithPrincipal and
+//     authn.WithRawToken applied to ctx.
 func UnaryServerInterceptor(v TokenValidator) grpc.UnaryServerInterceptor {
 	panic("TODO(S2 hand-build): grpcauth.UnaryServerInterceptor")
 }

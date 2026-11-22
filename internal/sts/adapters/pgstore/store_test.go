@@ -93,12 +93,14 @@ func TestPartnerRegistry(t *testing.T) {
 		t.Fatalf("Client = %+v, %v", c, err)
 	}
 
-	p.Status = domain.PartnerSuspended
-	if err := s.UpsertPartner(ctx, p); err != nil {
+	if err := s.SetStatus(ctx, "it-shopr", domain.PartnerSuspended); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.Partner(ctx, "it-shopr"); got.Active() {
-		t.Fatal("upsert did not update status")
+		t.Fatal("SetStatus did not suspend")
+	}
+	if err := s.SetStatus(ctx, "it-ghost", domain.PartnerActive); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("SetStatus on missing partner: %v", err)
 	}
 
 	if _, err := s.Partner(ctx, "it-ghost"); !errors.Is(err, domain.ErrNotFound) {

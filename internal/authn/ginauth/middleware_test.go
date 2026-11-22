@@ -33,7 +33,8 @@ func newRouter(v ginauth.TokenValidator, called *bool, seen *authn.Principal) *g
 	r.GET("/x", func(c *gin.Context) {
 		*called = true
 		p, ok := authn.FromContext(c.Request.Context())
-		if ok {
+		raw, rawOK := authn.RawTokenFrom(c.Request.Context())
+		if ok && rawOK && raw == goodToken {
 			*seen = p
 		}
 		c.Status(http.StatusOK)
@@ -78,7 +79,7 @@ func TestMiddleware(t *testing.T) {
 				t.Fatalf("handler called = %v, want %v", called, tc.wantStatus == 200)
 			}
 			if tc.wantStatus == 200 && seen.Subject != "user-anna" {
-				t.Fatalf("principal not in request context, got %+v", seen)
+				t.Fatalf("principal and raw token not in request context, got %+v", seen)
 			}
 			if tc.wantRaw != "" && (len(fv.got) != 1 || fv.got[0] != tc.wantRaw) {
 				t.Fatalf("validator got %q, want [%q]", fv.got, tc.wantRaw)

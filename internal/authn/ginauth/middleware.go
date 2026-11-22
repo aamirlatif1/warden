@@ -20,8 +20,8 @@ type TokenValidator interface {
 //   - No credentials → 401, WWW-Authenticate: Bearer (no error= attribute).
 //   - Wrong scheme / invalid token → 401, WWW-Authenticate: Bearer
 //     error="invalid_token". Never echo the token in the body or headers.
-//   - Success → principal stored with authn.WithPrincipal on
-//     c.Request.Context(), then c.Next().
+//   - Success → principal and raw token stored with authn.WithPrincipal
+//     and authn.WithRawToken on c.Request.Context(), then c.Next().
 func Middleware(v TokenValidator) gin.HandlerFunc {
 	panic("TODO(S2 hand-build): ginauth.Middleware")
 }

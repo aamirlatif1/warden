@@ -179,6 +179,12 @@ func TestValidateRejects(t *testing.T) {
 		{"revoked jti (STS)", func(t *testing.T) string {
 			return sign(t, stsSpec(t), with(stsClaims(), "jti", "revoked-jti"))
 		}, authn.ReasonRevoked},
+		{"D13 suspended partner, token issued before the cut-off", func(t *testing.T) string {
+			return sign(t, stsSpec(t), with(stsClaims(), "client_id", "suspended-client", "iat", unix(-2*time.Minute)))
+		}, authn.ReasonRevoked},
+		{"suspended partner, token without iat (fail closed)", func(t *testing.T) string {
+			return sign(t, stsSpec(t), with(stsClaims(), "client_id", "suspended-client", "iat", nil))
+		}, authn.ReasonRevoked},
 	}
 
 	for _, tc := range cases {
@@ -265,6 +271,13 @@ func TestValidateAccepts(t *testing.T) {
 				return sign(t, s, stsClaims())
 			},
 			want: authn.Principal{Subject: "shopr", Issuer: stsIss, TokenID: "sts-jti-1"},
+		},
+		{
+			name: "suspended partner, token issued after the cut-off (resumed)",
+			tok: func(t *testing.T) string {
+				return sign(t, stsSpec(t), with(stsClaims(), "client_id", "suspended-client", "iat", unix(-30*time.Second)))
+			},
+			want: authn.Principal{Subject: "shopr", Issuer: stsIss, ClientID: "suspended-client"},
 		},
 		{
 			name: "Cognito access token",
@@ -363,6 +376,38 @@ func issuerOf(e *authn.Error) string {
 		return "<nil error>"
 	}
 	return e.Issuer
+}
+
+// The denylist must be asked with the issuer (jti values are only unique
+// per issuer), the client and iat, and only for tokens that passed every
+// other check.
+func TestDenylistGetsFullTokenRef(t *testing.T) {
+	ks := k(t)
+	dl := &recordingDenylist{}
+	v, err := authn.NewValidator(authn.Config{
+		Issuers: []authn.Issuer{
+			{Profile: authn.PartnerSTSProfile(stsIss, audience), Keys: newStaticKeys(pubJWK(ks.sts, stsKid, jose.ES256))},
+		},
+		Denylist: dl,
+		Now:      func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Validate(context.Background(), sign(t, stsSpec(t), stsClaims())); err != nil {
+		t.Fatal(err)
+	}
+	want := authn.TokenRef{Issuer: stsIss, JTI: "sts-jti-1", ClientID: "shopr", IssuedAt: now}
+	if len(dl.got) != 1 || dl.got[0].Issuer != want.Issuer || dl.got[0].JTI != want.JTI ||
+		dl.got[0].ClientID != want.ClientID || !dl.got[0].IssuedAt.Equal(want.IssuedAt) {
+		t.Fatalf("Revoked called with %+v, want [%+v]", dl.got, want)
+	}
+
+	dl.got = nil
+	_, _ = v.Validate(context.Background(), sign(t, stsSpec(t), with(stsClaims(), "aud", "other")))
+	if len(dl.got) != 0 {
+		t.Fatal("denylist consulted for a token that failed an earlier check")
+	}
 }
 
 func TestValidatorIsSafeForConcurrentUse(t *testing.T) {
