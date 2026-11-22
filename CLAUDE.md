@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-In progress (S0–S3 scaffolding done; hand-build bodies in `internal/authn`,
-`internal/authn/jwks`, `ginauth`, `grpcauth` and `authz.Decide` are the
-author's, still `TODO` stubs until written). The source of truth is
+In progress (S0–S4 scaffolding done; hand-build bodies in `internal/authn`,
+`internal/authn/jwks`, `ginauth`, `grpcauth`, `authz.Decide` and
+`sts/clientauth` are the author's, still `TODO` stubs until written). Client
+assertions use `aud` = STS issuer identifier only (rfc7523bis), a deliberate
+deviation from FR-4's "token endpoint URL". The source of truth is
 `REQUIREMENTS.md` (FR-1…FR-7, drills, ADRs, Definition of Done) and
 `SCHEDULE.md` (sessions S0–S9, hand-build vs delegate split, cut list). Both are
 **local working notes, gitignored on purpose**. Never commit them, and never
@@ -104,6 +106,7 @@ Targets (`make help` lists what exists; `drills`, `demo*` come later):
 
 - `make test-db` — pgstore integration tests (Postgres `warden_test` database)
 - `make seed` — demo policies/claims owned by the Keycloak seed users' `sub`
+- `make kms-key`, `make sts-seed`, `make run-sts` — partner-sts setup (keys in gitignored `.local/`)
 
 Single test: `go test -race -run TestName ./internal/authn/`.
 

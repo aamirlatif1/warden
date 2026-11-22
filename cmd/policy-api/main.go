@@ -35,17 +35,22 @@ type config struct {
 	audience        string
 	keycloakIssuer  string
 	keycloakJWKSURL string
+	stsIssuer       string
+	stsJWKSURL      string
 	databaseURL     string
 }
 
 func loadConfig() config {
 	issuer := env("WARDEN_KEYCLOAK_ISSUER", "http://localhost:8080/realms/insurance")
+	stsIssuer := env("WARDEN_STS_ISSUER", "http://localhost:8083")
 	return config{
 		grpcAddr:        env("WARDEN_GRPC_ADDR", ":9090"),
 		httpAddr:        env("WARDEN_HTTP_ADDR", ":8081"),
 		audience:        env("WARDEN_API_AUDIENCE", "policy-api"),
 		keycloakIssuer:  issuer,
 		keycloakJWKSURL: env("WARDEN_KEYCLOAK_JWKS_URL", issuer+"/protocol/openid-connect/certs"),
+		stsIssuer:       stsIssuer,
+		stsJWKSURL:      env("WARDEN_STS_JWKS_URL", stsIssuer+"/jwks.json"),
 		databaseURL:     env("WARDEN_DATABASE_URL", "postgres://warden:warden@localhost:5434/warden?sslmode=disable"),
 	}
 }
@@ -71,17 +76,14 @@ func run(log *slog.Logger) error {
 	cfg := loadConfig()
 
 	// ---- authn: one validator shared by REST and gRPC ----
-	kcKeys := jwks.New(cfg.keycloakJWKSURL, jwks.Options{})
-	if err := kcKeys.Refresh(ctx); err != nil {
-		// Not fatal: the first token triggers a fetch, and Run keeps trying.
-		log.Warn("initial JWKS fetch failed", "issuer", "keycloak", "err", err)
-	}
-	go kcKeys.Run(ctx)
+	// One JWKS cache per issuer: keys are never shared across issuers.
+	kcKeys := startJWKS(ctx, log, "keycloak", cfg.keycloakJWKSURL)
+	stsKeys := startJWKS(ctx, log, "partner-sts", cfg.stsJWKSURL)
 
 	validator, err := authn.NewValidator(authn.Config{
 		Issuers: []authn.Issuer{
 			{Profile: authn.KeycloakProfile(cfg.keycloakIssuer, cfg.audience), Keys: kcKeys},
-			// S4: partner-sts profile.
+			{Profile: authn.PartnerSTSProfile(cfg.stsIssuer, cfg.audience), Keys: stsKeys},
 		},
 	})
 	if err != nil {
@@ -138,7 +140,8 @@ func run(log *slog.Logger) error {
 			errc <- err
 		}
 	}()
-	log.Info("policy-api listening", "grpc", cfg.grpcAddr, "http", cfg.httpAddr, "keycloak_issuer", cfg.keycloakIssuer)
+	log.Info("policy-api listening", "grpc", cfg.grpcAddr, "http", cfg.httpAddr,
+		"keycloak_issuer", cfg.keycloakIssuer, "sts_issuer", cfg.stsIssuer)
 
 	select {
 	case <-ctx.Done():
@@ -152,4 +155,16 @@ func run(log *slog.Logger) error {
 	_ = httpSrv.Shutdown(shutdownCtx)
 	grpcSrv.GracefulStop()
 	return nil
+}
+
+// startJWKS warms an issuer's key cache and starts its background refresh.
+// A failed first fetch is not fatal: the issuer may start later, and the
+// first token with an unknown kid triggers a (rate-limited) fetch.
+func startJWKS(ctx context.Context, log *slog.Logger, name, url string) *jwks.Cache {
+	c := jwks.New(url, jwks.Options{})
+	if err := c.Refresh(ctx); err != nil {
+		log.Warn("initial JWKS fetch failed", "issuer", name, "url", url, "err", err)
+	}
+	go c.Run(ctx)
+	return c
 }

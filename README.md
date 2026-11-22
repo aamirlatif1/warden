@@ -17,7 +17,7 @@ Work in progress. What runs today:
 | Local stack (Keycloak 26, Postgres, Redis, OpenLDAP, LocalStack KMS + Secrets Manager, Grafana LGTM) | Working |
 | Keycloak realm `insurance` as code (OpenTofu + Terragrunt) | Working |
 | `policy-api` (resource server, gRPC + REST) | In progress: API, Postgres store, seed data, authz wiring and the authn/authz test suites done; token validator, JWKS cache and `authz.Decide` being written by hand |
-| `partner-sts` (custom token issuer for partners, KMS-signed) | Planned |
+| `partner-sts` (custom token issuer for partners, KMS-signed) | In progress: token endpoint, discovery, JWKS, KMS and local signers, partner registry, replay store done; `private_key_jwt` verification being written by hand; rotation and revocation next |
 | `bff` (policyholder portal, server-side sessions, step-up) | Planned |
 | SAML federation, LDAP federation, MFA flows | Planned |
 | Attack drills, threat model, ADRs | Planned |
@@ -68,9 +68,13 @@ curl -s http://localhost:8080/realms/insurance/.well-known/openid-configuration 
 | `make bench` | Token validation benchmarks (`internal/authn`, target < 50 µs/op warm) |
 | `make proto-tools` / `make proto` | Install pinned buf + protoc plugins into `./bin`; lint and regenerate `gen/` |
 | `make run-api` | Run `policy-api` on the host: gRPC `:9090`, REST `:8081` |
-| `make test-db` | Postgres integration tests for the store (separate `warden_test` database) |
+| `make test-db` | Integration tests against the compose Postgres (`warden_test`), Redis and LocalStack KMS |
 | `make seed` | Demo policies and claims owned by the Keycloak users `anna` and `bob` (by their `sub`) |
 | `make check-s3` | With anna's real token: own policy 200, bob's policy 403 (BOLA), payout change 401 with the RFC 9470 step-up challenge |
+| `make kms-key` | Create the STS signing key (`ECC_NIST_P256`, alias `alias/warden-sts`) in LocalStack KMS; safe to re-run |
+| `make sts-seed` | Create Shopr's key pair in `.local/` (gitignored) and register Shopr in partner-sts |
+| `make run-sts` | Run `partner-sts` on `:8083` (`WARDEN_SIGNER=kms`, or `local` for a file key) |
+| `make demo-partner` | Partner demo: token, assertion replay refused, quote created, cross-tenant quote 403 |
 | `make check-s2` | Get a client-credentials token from Keycloak and check `policy-api` accepts it and rejects no / tampered / `alg=none` tokens |
 | `make help` | List the targets |
 
@@ -175,6 +179,37 @@ decision:
 A non-owner gets 403 and is never sent to MFA. Data lives in Postgres
 (`warden` database, GORM); `make seed` loads the demo rows.
 
+## partner-sts
+
+The token issuer for partner backends. A partner authenticates with
+`private_key_jwt` (RFC 7523): it signs a short-lived JWT with its own
+private key, and partner-sts checks it against the public key in the
+partner registry. No shared secret exists anywhere.
+
+- **Assertion rules:** ES256 only; `iss` = `sub` = `client_id`; `aud` is
+  exactly the STS issuer identifier (`http://localhost:8083`), as the OAuth
+  WG's rfc7523bis draft requires after the 2025 audience-injection finding.
+  That is stricter than the original RFC 7523 "token endpoint URL", which
+  partner-sts rejects. Lifetime at most 5 min. The `jti` is recorded in
+  Redis with `SET NX` until the assertion expires, so a replay is refused
+  (`invalid_client`), and only after every other check passed, so a forged
+  assertion can't burn a real `jti`.
+- **Tokens:** `at+jwt` (RFC 9068), ES256, 5 min, `aud=policy-api`, with
+  `client_id`, `partner_id` and the requested scope narrowed to what the
+  partner is allowed.
+- **Signing:** the private key stays in KMS. partner-sts sends a SHA-256
+  digest and gets back a DER-encoded ECDSA signature, which JWS can't use:
+  it needs R and S as two fixed 32-byte values (RFC 7518 §3.4).
+  `internal/kms/der.go` converts it, and a startup self-test signs and
+  verifies a probe so a wrong format fails at boot, not on every request.
+  The `kid` is the key's RFC 7638 thumbprint.
+- **Endpoints:** `POST /token`, `GET /.well-known/oauth-authorization-server`
+  (also at `openid-configuration`), `GET /jwks.json` (cacheable 5 min).
+
+policy-api trusts it through a second issuer profile (ES256, `typ`
+`at+jwt`, its own JWKS cache). Rotation, revocation and introspection come
+next.
+
 ## Repository layout
 
 ```text
@@ -191,8 +226,17 @@ internal/
     app/              use cases and the store interfaces they need
     adapters/         grpcapi, httpapi (driving); pgstore, memstore (driven)
   authz/              authorization engine: Decide, reasons, step-up challenge
+  issuer/             token minting (compact JWS) over a Signer
+  kms/                KMS and local ES256 signers, DER → JOSE conversion
+  sts/
+    clientauth/       private_key_jwt assertion verification
+    domain/, app/     partner, token use case
+    adapters/         httpapi (driving); pgstore, redisreplay (driven)
 cmd/policy-seed/      demo data loader
-scripts/              acceptance checks (check-s3.sh)
+cmd/partner-sts/      partner token issuer (composition root)
+cmd/sts-seed/         registers a partner
+cmd/partnercli/       plays partner Shopr: keygen, assertions, tokens
+scripts/              acceptance checks and demos
 deploy/
   compose.yaml        local stack
   postgres/init.sql   creates the keycloak and warden databases

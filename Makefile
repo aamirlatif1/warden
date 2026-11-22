@@ -29,7 +29,7 @@ ANNA_PASSWORD         ?= anna-dev-password
 
 .PHONY: help up down clean tools infra infra-plan infra-check check-s1 \
 	proto-tools proto proto-lint test bench run-api check-s2 \
-	test-db seed check-s3
+	test-db seed check-s3 kms-key partner-keys sts-seed run-sts demo-partner
 
 help: ## List targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -96,10 +96,12 @@ check-s2: tools ## S2 acceptance: a real Keycloak token is accepted by policy-ap
 	check "tampered token rejected"   "$$(code -H "Authorization: Bearer $${token%?????}AAAAA" $(API_URL)/v1/policies)" 401; \
 	check "alg=none token rejected"   "$$(code -H "Authorization: Bearer $$(printf '{"alg":"none"}' | base64 | tr '+/' '-_' | tr -d '=').$$(cut -d. -f2 <<<"$$token")." $(API_URL)/v1/policies)" 401
 
-test-db: ## pgstore integration tests against the compose Postgres (needs make up)
+test-db: ## Integration tests against compose Postgres, Redis and LocalStack KMS (needs make up)
 	@$(COMPOSE) exec -T postgres psql -q -U postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'warden_test'" | grep -q 1 \
 		|| $(COMPOSE) exec -T postgres psql -q -U postgres -c "CREATE DATABASE warden_test OWNER warden"
-	WARDEN_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' go test -race -count=1 ./internal/policy/adapters/pgstore/
+	WARDEN_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' WARDEN_TEST_REDIS_ADDR=localhost:6379 \
+	WARDEN_TEST_KMS_ENDPOINT=http://localhost:4566 \
+		go test -race -count=1 ./internal/policy/adapters/pgstore/ ./internal/sts/adapters/... ./internal/kms/
 
 seed: tools ## Load demo policies and claims, owned by the Keycloak seed users (needs make infra)
 	@set -euo pipefail; \
@@ -112,3 +114,29 @@ check-s3: tools ## S3 acceptance: D6 (BOLA) and D7 (step-up challenge) with anna
 	TEST_CLIENT_SECRET=$$($(TG_REALM) output -json client_secrets 2>/dev/null | jq -r '."warden-test"') \
 	ANNA_PASSWORD='$(ANNA_PASSWORD)' KEYCLOAK_URL='$(KEYCLOAK_URL)' API_URL='$(API_URL)' \
 	./scripts/check-s3.sh
+
+KMS_ALIAS  := alias/warden-sts
+AWSLOCAL    = $(COMPOSE) exec -T localstack awslocal --region eu-central-1
+
+kms-key: ## Create the STS signing key (ECC_NIST_P256) in LocalStack KMS, if missing
+	@if $(AWSLOCAL) kms describe-key --key-id $(KMS_ALIAS) >/dev/null 2>&1; then \
+		echo "$(KMS_ALIAS) exists"; \
+	else \
+		id=$$($(AWSLOCAL) kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY \
+			--description "warden partner-sts signing key" --query KeyMetadata.KeyId --output text) && \
+		$(AWSLOCAL) kms create-alias --alias-name $(KMS_ALIAS) --target-key-id "$$id" && \
+		echo "created $(KMS_ALIAS) -> $$id"; \
+	fi
+
+partner-keys: ## Create Shopr's private key and public JWKS in .local/ (kept if present)
+	go run ./cmd/partnercli keygen -key .local/shopr.key.pem -jwks .local/shopr.jwks.json -kid shopr-1
+
+sts-seed: partner-keys ## Register partner Shopr (client_id shopr, tenant shopr) in partner-sts
+	WARDEN_DATABASE_URL='$(DATABASE_URL)' go run ./cmd/sts-seed -client-id shopr -partner-id shopr \
+		-name Shopr -scopes "quotes:read quotes:write" -jwks .local/shopr.jwks.json
+
+run-sts: ## Run partner-sts on :8083 (WARDEN_SIGNER=kms by default; local for a file key)
+	go run ./cmd/partner-sts
+
+demo-partner: ## Partner M2M demo: token, D12 replay, quote, D5 cross-tenant 403 (needs run-sts + run-api)
+	./scripts/demo-partner.sh

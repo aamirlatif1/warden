@@ -21,3 +21,6 @@ deploy/pki/*.key
 *.tfstate*
 .terraform/
 .terragrunt-cache/
+
+# Local dev keys (partner and STS signing keys)
+.local/
