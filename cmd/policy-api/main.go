@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/aamirlatif1/warden/internal/policy/adapters/pgstore"
 	"github.com/aamirlatif1/warden/internal/policy/app"
 	"github.com/aamirlatif1/warden/internal/revocation"
+	"github.com/aamirlatif1/warden/internal/tlsutil"
 )
 
 type config struct {
@@ -42,6 +44,8 @@ type config struct {
 	stsJWKSURL      string
 	databaseURL     string
 	redisAddr       string
+	mtlsAddr        string // internal listener for the BFF (mTLS)
+	pkiDir          string
 	// RFC 7662 credentials (policy-api's client secret at each issuer);
 	// empty disables introspection for that issuer.
 	keycloakIntrospectSecret string
@@ -61,6 +65,8 @@ func loadConfig() config {
 		stsJWKSURL:      env("WARDEN_STS_JWKS_URL", stsIssuer+"/jwks.json"),
 		databaseURL:     env("WARDEN_DATABASE_URL", "postgres://warden:warden@localhost:5434/warden?sslmode=disable"),
 		redisAddr:       env("WARDEN_REDIS_ADDR", "localhost:6379"),
+		mtlsAddr:        env("WARDEN_MTLS_ADDR", ":8444"),
+		pkiDir:          env("WARDEN_PKI_DIR", "deploy/pki"),
 
 		keycloakIntrospectSecret: os.Getenv("WARDEN_KEYCLOAK_INTROSPECT_SECRET"),
 		stsIntrospectSecret:      os.Getenv("WARDEN_STS_INTROSPECT_SECRET"),
@@ -142,9 +148,10 @@ func run(log *slog.Logger) error {
 
 	// ---- REST ----
 	gin.SetMode(gin.ReleaseMode)
+	restHandler := httpapi.NewRouter(svc, ginauth.Middleware(validator), log)
 	httpSrv := &http.Server{
 		Addr:              cfg.httpAddr,
-		Handler:           httpapi.NewRouter(svc, ginauth.Middleware(validator), log),
+		Handler:           restHandler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -152,8 +159,24 @@ func run(log *slog.Logger) error {
 		MaxHeaderBytes:    32 << 10,
 	}
 
-	errc := make(chan error, 2)
+	// ---- REST over mTLS, for the BFF ----
+	// Same handler; the listener only admits the BFF's client certificate.
+	// Bearer tokens are still validated: mTLS authenticates the caller
+	// service, the token the user.
+	mtlsSrv, err := newMTLSServer(cfg, restHandler, log)
+	if err != nil {
+		return err
+	}
+
+	errc := make(chan error, 3)
 	go func() { errc <- grpcSrv.Serve(lis) }()
+	if mtlsSrv != nil {
+		go func() {
+			if err := mtlsSrv.ListenAndServeTLS("", ""); !errors.Is(err, http.ErrServerClosed) {
+				errc <- err
+			}
+		}()
+	}
 	go func() {
 		if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
@@ -172,6 +195,9 @@ func run(log *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if mtlsSrv != nil {
+		_ = mtlsSrv.Shutdown(shutdownCtx)
+	}
 	grpcSrv.GracefulStop()
 	return nil
 }
@@ -208,4 +234,23 @@ func newIntrospector(cfg config, log *slog.Logger) app.Introspector {
 		return nil
 	}
 	return introspect.New(eps, nil)
+}
+
+// newMTLSServer returns nil (and logs) when the dev PKI does not exist yet.
+func newMTLSServer(cfg config, h http.Handler, log *slog.Logger) (*http.Server, error) {
+	cert := filepath.Join(cfg.pkiDir, "policy-api.pem")
+	if _, err := os.Stat(cert); err != nil {
+		log.Warn("no PKI: mTLS listener disabled (run make pki)", "dir", cfg.pkiDir)
+		return nil, nil
+	}
+	tlsCfg, err := tlsutil.ServerMTLS(cert, filepath.Join(cfg.pkiDir, "policy-api.key"),
+		filepath.Join(cfg.pkiDir, "ca.pem"), "spiffe://warden.local/bff")
+	if err != nil {
+		return nil, fmt.Errorf("mtls: %w", err)
+	}
+	log.Info("mTLS listener", "addr", cfg.mtlsAddr, "allowed_clients", "spiffe://warden.local/bff")
+	return &http.Server{
+		Addr: cfg.mtlsAddr, Handler: h, TLSConfig: tlsCfg,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second,
+	}, nil
 }
