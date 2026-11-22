@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Pre-code. The repo currently holds only planning docs. The source of truth is
+In progress (S0–S3 scaffolding done; hand-build bodies in `internal/authn`,
+`internal/authn/jwks`, `ginauth`, `grpcauth` and `authz.Decide` are the
+author's, still `TODO` stubs until written). The source of truth is
 `REQUIREMENTS.md` (FR-1…FR-7, drills, ADRs, Definition of Done) and
 `SCHEDULE.md` (sessions S0–S9, hand-build vs delegate split, cut list). Both are
 **local working notes, gitignored on purpose**. Never commit them, and never
@@ -46,9 +48,16 @@ the custom STS), underwriter (LDAP federation → realm role).
   interfaces, and don't add an interface until there is a consumer for it.
   Accept interfaces, return structs.
 - policy-api's REST and gRPC are two driving adapters over the same `app`
-  services (Gin replaces grpc-gateway from REQUIREMENTS.md). Authn/authz run
-  as Gin middleware and a gRPC interceptor that share one validator and one
-  `Decide()`.
+  services (Gin replaces grpc-gateway from REQUIREMENTS.md). **Authn** runs as
+  Gin middleware and a gRPC interceptor sharing one validator. **Authz runs in
+  the `app` layer**: each use case loads the resource, calls `authz.Decide()`
+  (injected via `app.Deps.Decide`), logs the decision, and only then validates
+  input and acts. Ownership and amount checks need the loaded resource, which
+  middleware doesn't have. `app` may import `authn.Principal` and `authz`
+  (both pure). Adapters map `*authz.DeniedError` → 403/`PermissionDenied` and
+  `*authz.StepUpError` → 401 + RFC 9470 `WWW-Authenticate` (gRPC: trailer).
+- ABAC attributes owned by the business (e.g. an underwriter's approval
+  limit) live in policy-api's Postgres, keyed by `sub`, not in token claims.
 - GORM models live in the driven adapter and are mapped to/from domain types;
   `gorm.Model` tags and `*gorm.DB` never leak into `domain` or `app`.
   Transactions are exposed to `app` through a small consumer-side interface,
@@ -81,9 +90,9 @@ drill harness plumbing, CI, load-test scripts. Include tests with delegated code
 After each session, `docs/ai-log.md` gets one line: what was delegated, what
 Claude got wrong, what was changed.
 
-## Planned commands
+## Commands
 
-None exist yet; these are the targets the Makefile must provide:
+Targets (`make help` lists what exists; `drills`, `demo*` come later):
 
 - `make up` — docker compose stack (`deploy/compose.yaml`): Keycloak 26 (Postgres-backed), Postgres, Redis, OpenLDAP, LocalStack (KMS + Secrets Manager), grafana/otel-lgtm
 - `make infra` — `terragrunt run --all apply` over `infra/live/local`; a second run must show no changes
@@ -93,6 +102,9 @@ None exist yet; these are the targets the Makefile must provide:
 - `make demo`, `make demo-partner`
 - CI also runs `golangci-lint`, `gosec`, `govulncheck`, `buf lint`, `buf breaking --against main`, `tofu fmt -check`, `tofu validate`
 
+- `make test-db` — pgstore integration tests (Postgres `warden_test` database)
+- `make seed` — demo policies/claims owned by the Keycloak seed users' `sub`
+
 Single test: `go test -race -run TestName ./internal/authn/`.
 
 ## Architecture
@@ -100,7 +112,7 @@ Single test: `go test -race -run TestName ./internal/authn/`.
 Single Go module, three services plus Keycloak:
 
 - **`cmd/policy-api`** (gRPC :9090, REST :8081 via Gin) — resource
-  server. Every call: authn interceptor → `authz.Decide()`. Accepts tokens from
+  server. Every call: authn interceptor → use case → `authz.Decide()`. Accepts tokens from
   two issuers (Keycloak RS256 and partner-sts ES256), selected by exact `iss`
   match against **issuer profiles** (`internal/authn/profiles.go`), each pinning
   its alg, JWKS source, audience rule and claim mapping (a Cognito profile uses

@@ -13,17 +13,18 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/aamirlatif1/warden/internal/authn"
+	"github.com/aamirlatif1/warden/internal/authz"
 	"github.com/aamirlatif1/warden/internal/policy/app"
 	"github.com/aamirlatif1/warden/internal/policy/domain"
 )
 
 // PolicyService is the part of *app.Service this adapter calls.
 type PolicyService interface {
-	CreateQuote(ctx context.Context, in app.CreateQuoteInput) (domain.Quote, error)
-	ListPolicies(ctx context.Context, holderSubject string) ([]domain.Policy, error)
-	GetPolicy(ctx context.Context, id string) (domain.Policy, error)
-	UpdatePayoutAccount(ctx context.Context, policyID, iban string) (domain.Policy, error)
-	ApproveClaim(ctx context.Context, claimID string) (domain.Claim, error)
+	CreateQuote(ctx context.Context, p authn.Principal, in app.CreateQuoteInput) (domain.Quote, error)
+	ListPolicies(ctx context.Context, p authn.Principal) ([]domain.Policy, error)
+	GetPolicy(ctx context.Context, p authn.Principal, id string) (domain.Policy, error)
+	UpdatePayoutAccount(ctx context.Context, p authn.Principal, policyID, iban string) (domain.Policy, error)
+	ApproveClaim(ctx context.Context, p authn.Principal, claimID string) (domain.Claim, error)
 }
 
 type handlers struct {
@@ -44,7 +45,7 @@ func NewRouter(svc PolicyService, auth gin.HandlerFunc, log *slog.Logger) *gin.E
 
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 
-	v1 := r.Group("/v1", auth)
+	v1 := r.Group("/v1", auth, requirePrincipal)
 	v1.POST("/quotes", h.createQuote)
 	v1.GET("/policies", h.listPolicies)
 	v1.GET("/policies/:id", h.getPolicy)
@@ -53,6 +54,23 @@ func NewRouter(svc PolicyService, auth gin.HandlerFunc, log *slog.Logger) *gin.E
 	// wildcard per segment, so the handler splits the ":approve" suffix.
 	v1.POST("/claims/:idAction", h.claimAction)
 	return r
+}
+
+// requirePrincipal guards against a misconfigured auth middleware: no
+// principal in the context means 401, never an anonymous call.
+func requirePrincipal(c *gin.Context) {
+	if _, ok := authn.FromContext(c.Request.Context()); !ok {
+		c.Header("WWW-Authenticate", `Bearer realm="warden"`)
+		c.AbortWithStatusJSON(http.StatusUnauthorized, errBody("unauthenticated"))
+		return
+	}
+	c.Next()
+}
+
+// principal is safe after requirePrincipal.
+func principal(c *gin.Context) authn.Principal {
+	p, _ := authn.FromContext(c.Request.Context())
+	return p
 }
 
 type moneyJSON struct {
@@ -93,7 +111,7 @@ func (h *handlers) createQuote(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, errBody("invalid JSON body"))
 		return
 	}
-	q, err := h.svc.CreateQuote(c.Request.Context(), app.CreateQuoteInput{
+	q, err := h.svc.CreateQuote(c.Request.Context(), principal(c), app.CreateQuoteInput{
 		PartnerID:    req.PartnerID,
 		Product:      req.Product,
 		InsuredValue: domain.Money{AmountMinor: req.InsuredValue.AmountMinor, Currency: req.InsuredValue.Currency},
@@ -110,12 +128,7 @@ func (h *handlers) createQuote(c *gin.Context) {
 }
 
 func (h *handlers) listPolicies(c *gin.Context) {
-	p, ok := authn.FromContext(c.Request.Context())
-	if !ok {
-		c.JSON(http.StatusUnauthorized, errBody("unauthenticated"))
-		return
-	}
-	ps, err := h.svc.ListPolicies(c.Request.Context(), p.Subject)
+	ps, err := h.svc.ListPolicies(c.Request.Context(), principal(c))
 	if err != nil {
 		h.fail(c, err)
 		return
@@ -128,7 +141,7 @@ func (h *handlers) listPolicies(c *gin.Context) {
 }
 
 func (h *handlers) getPolicy(c *gin.Context) {
-	pol, err := h.svc.GetPolicy(c.Request.Context(), c.Param("id"))
+	pol, err := h.svc.GetPolicy(c.Request.Context(), principal(c), c.Param("id"))
 	if err != nil {
 		h.fail(c, err)
 		return
@@ -144,7 +157,7 @@ func (h *handlers) updatePayoutAccount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, errBody("invalid JSON body"))
 		return
 	}
-	pol, err := h.svc.UpdatePayoutAccount(c.Request.Context(), c.Param("id"), req.IBAN)
+	pol, err := h.svc.UpdatePayoutAccount(c.Request.Context(), principal(c), c.Param("id"), req.IBAN)
 	if err != nil {
 		h.fail(c, err)
 		return
@@ -158,7 +171,7 @@ func (h *handlers) claimAction(c *gin.Context) {
 		c.JSON(http.StatusNotFound, errBody("not found"))
 		return
 	}
-	cl, err := h.svc.ApproveClaim(c.Request.Context(), id)
+	cl, err := h.svc.ApproveClaim(c.Request.Context(), principal(c), id)
 	if err != nil {
 		h.fail(c, err)
 		return
@@ -171,7 +184,20 @@ func (h *handlers) claimAction(c *gin.Context) {
 }
 
 func (h *handlers) fail(c *gin.Context, err error) {
+	var denied *authz.DeniedError
+	var stepUp *authz.StepUpError
 	switch {
+	case errors.As(err, &stepUp):
+		// RFC 9470: the client re-authenticates with acr_values and max_age.
+		c.Header("WWW-Authenticate", stepUp.Challenge())
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "insufficient_user_authentication", "reason": stepUp.Reason})
+	case errors.As(err, &denied):
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden", "reason": denied.Reason})
+	case errors.Is(err, app.ErrTokenInactive):
+		c.Header("WWW-Authenticate", `Bearer realm="warden", error="invalid_token"`)
+		c.JSON(http.StatusUnauthorized, errBody("token inactive"))
+	case errors.Is(err, app.ErrUnavailable):
+		c.JSON(http.StatusServiceUnavailable, errBody("temporarily unavailable"))
 	case errors.Is(err, domain.ErrNotFound):
 		c.JSON(http.StatusNotFound, errBody("not found"))
 	case errors.Is(err, domain.ErrInvalidArgument):

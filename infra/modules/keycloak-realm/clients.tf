@@ -65,8 +65,12 @@ resource "keycloak_openid_client" "policy_api" {
   service_accounts_enabled     = false
 }
 
-# Local-only client-credentials client, so S2 can curl a real Keycloak
-# token into policy-api.
+# Local-only test client for curl checks (make check-s2, check-s3):
+#   - client credentials: a service-account token for policy-api;
+#   - password grant (ROPC): a seed user's token without a browser.
+# ROPC is deprecated (OAuth 2.0 Security BCP) and is never enabled on the
+# browser clients or outside live/local. A password-grant token has acr=1,
+# which is exactly what the step-up drill (D7) needs.
 resource "keycloak_openid_client" "test" {
   count = var.enable_test_client ? 1 : 0
 
@@ -77,7 +81,7 @@ resource "keycloak_openid_client" "test" {
 
   standard_flow_enabled        = false
   implicit_flow_enabled        = false
-  direct_access_grants_enabled = false
+  direct_access_grants_enabled = true
   service_accounts_enabled     = true
 }
 

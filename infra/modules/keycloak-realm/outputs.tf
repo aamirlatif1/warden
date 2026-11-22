@@ -15,3 +15,8 @@ output "client_secrets" {
     var.enable_test_client ? { "warden-test" = keycloak_openid_client.test[0].client_secret } : {},
   )
 }
+
+output "user_ids" {
+  description = "Keycloak user ID (the sub claim) of each seed user. policy-seed uses these as policy owners."
+  value       = { for name, u in keycloak_user.seed : name => u.id }
+}

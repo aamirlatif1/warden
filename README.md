@@ -16,7 +16,7 @@ Work in progress. What runs today:
 | --- | --- |
 | Local stack (Keycloak 26, Postgres, Redis, OpenLDAP, LocalStack KMS + Secrets Manager, Grafana LGTM) | Working |
 | Keycloak realm `insurance` as code (OpenTofu + Terragrunt) | Working |
-| `policy-api` (resource server, gRPC + REST) | In progress: API, adapters and authn test suite done; token validator and JWKS cache being written by hand |
+| `policy-api` (resource server, gRPC + REST) | In progress: API, Postgres store, seed data, authz wiring and the authn/authz test suites done; token validator, JWKS cache and `authz.Decide` being written by hand |
 | `partner-sts` (custom token issuer for partners, KMS-signed) | Planned |
 | `bff` (policyholder portal, server-side sessions, step-up) | Planned |
 | SAML federation, LDAP federation, MFA flows | Planned |
@@ -68,6 +68,9 @@ curl -s http://localhost:8080/realms/insurance/.well-known/openid-configuration 
 | `make bench` | Token validation benchmarks (`internal/authn`, target < 50 µs/op warm) |
 | `make proto-tools` / `make proto` | Install pinned buf + protoc plugins into `./bin`; lint and regenerate `gen/` |
 | `make run-api` | Run `policy-api` on the host: gRPC `:9090`, REST `:8081` |
+| `make test-db` | Postgres integration tests for the store (separate `warden_test` database) |
+| `make seed` | Demo policies and claims owned by the Keycloak users `anna` and `bob` (by their `sub`) |
+| `make check-s3` | With anna's real token: own policy 200, bob's policy 403 (BOLA), payout change 401 with the RFC 9470 step-up challenge |
 | `make check-s2` | Get a client-credentials token from Keycloak and check `policy-api` accepts it and rejects no / tampered / `alg=none` tokens |
 | `make help` | List the targets |
 
@@ -155,8 +158,22 @@ claim mapping. Keys come from a JWKS cache with a rate-limited, singleflight
 refetch on an unknown `kid`. Every rejection carries a stable reason label
 (`alg_not_allowed`, `kid_unknown`, `aud_mismatch`, ...).
 
-Authorization (`authz.Decide`, ownership, step-up) arrives next; until then
-any valid token reaches the use cases, and data is in memory.
+Authorization (`internal/authz`) is a pure function,
+`Decide(principal, action, resource, env)`, that returns allow, deny with a
+reason, or step-up. Each use case loads the resource first, because
+ownership and amount checks need it, then asks the engine and logs the
+decision:
+
+| RPC | Rule |
+| --- | --- |
+| `CreateQuote` | scope `quotes:write` and token `partner_id` = request `partner_id` |
+| `ListPolicies` | role `policyholder`; only the caller's own policies |
+| `GetPolicy` | owner, or role `underwriter` |
+| `UpdatePayoutAccount` | owner, then `acr` ≥ 2 and `auth_time` ≤ 5 min, else 401 with an RFC 9470 challenge (`acr_values="gold", max_age=300`) |
+| `ApproveClaim` | role `underwriter` and amount ≤ the underwriter's approval limit (Postgres); above 10 000 € the token is checked online first, failing closed until that check exists |
+
+A non-owner gets 403 and is never sent to MFA. Data lives in Postgres
+(`warden` database, GORM); `make seed` loads the demo rows.
 
 ## Repository layout
 
@@ -172,7 +189,10 @@ internal/
   policy/
     domain/           entities and rules, pure Go
     app/              use cases and the store interfaces they need
-    adapters/         grpcapi, httpapi (driving); memstore (driven)
+    adapters/         grpcapi, httpapi (driving); pgstore, memstore (driven)
+  authz/              authorization engine: Decide, reasons, step-up challenge
+cmd/policy-seed/      demo data loader
+scripts/              acceptance checks (check-s3.sh)
 deploy/
   compose.yaml        local stack
   postgres/init.sql   creates the keycloak and warden databases

@@ -25,7 +25,7 @@ import (
 	"github.com/aamirlatif1/warden/internal/authn/jwks"
 	"github.com/aamirlatif1/warden/internal/policy/adapters/grpcapi"
 	"github.com/aamirlatif1/warden/internal/policy/adapters/httpapi"
-	"github.com/aamirlatif1/warden/internal/policy/adapters/memstore"
+	"github.com/aamirlatif1/warden/internal/policy/adapters/pgstore"
 	"github.com/aamirlatif1/warden/internal/policy/app"
 )
 
@@ -35,6 +35,7 @@ type config struct {
 	audience        string
 	keycloakIssuer  string
 	keycloakJWKSURL string
+	databaseURL     string
 }
 
 func loadConfig() config {
@@ -45,6 +46,7 @@ func loadConfig() config {
 		audience:        env("WARDEN_API_AUDIENCE", "policy-api"),
 		keycloakIssuer:  issuer,
 		keycloakJWKSURL: env("WARDEN_KEYCLOAK_JWKS_URL", issuer+"/protocol/openid-connect/certs"),
+		databaseURL:     env("WARDEN_DATABASE_URL", "postgres://warden:warden@localhost:5434/warden?sslmode=disable"),
 	}
 }
 
@@ -86,9 +88,28 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("authn config: %w", err)
 	}
 
+	// ---- storage ----
+	store, err := pgstore.Open(cfg.databaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
 	// ---- app ----
-	store := memstore.New() // S3: GORM/Postgres
-	svc := app.NewService(store, store, store)
+	svc := app.NewService(app.Deps{
+		Policies: store,
+		Quotes:   store,
+		Claims:   store,
+		Limits:   store,
+		Tx:       store,
+		// S5: introspection client for partner-sts / Keycloak. Until then,
+		// approvals above 10 000 EUR fail closed (503).
+		Introspector: nil,
+		Log:          log,
+	})
 
 	// ---- gRPC ----
 	grpcSrv := grpc.NewServer(grpc.ChainUnaryInterceptor(grpcauth.UnaryServerInterceptor(validator)))

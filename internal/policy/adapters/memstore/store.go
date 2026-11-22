@@ -1,5 +1,5 @@
-// Package memstore is an in-memory driven adapter for the app stores.
-// S2 only; S3 replaces it with GORM/Postgres and seed data.
+// Package memstore is an in-memory driven adapter for the app stores, used
+// by unit tests. policy-api itself runs on pgstore (Postgres).
 package memstore
 
 import (
@@ -11,10 +11,12 @@ import (
 )
 
 type Store struct {
+	txMu     sync.Mutex
 	mu       sync.RWMutex
 	policies map[string]domain.Policy
 	quotes   map[string]domain.Quote
 	claims   map[string]domain.Claim
+	limits   map[string]int64
 }
 
 func New() *Store {
@@ -22,6 +24,7 @@ func New() *Store {
 		policies: map[string]domain.Policy{},
 		quotes:   map[string]domain.Quote{},
 		claims:   map[string]domain.Claim{},
+		limits:   map[string]int64{},
 	}
 }
 
@@ -95,4 +98,29 @@ func (s *Store) SaveClaim(_ context.Context, c domain.Claim) error {
 	defer s.mu.Unlock()
 	s.claims[c.ID] = c
 	return nil
+}
+
+// GetClaimForUpdate has no locking here; InTx serialises instead.
+func (s *Store) GetClaimForUpdate(ctx context.Context, id string) (domain.Claim, error) {
+	return s.GetClaim(ctx, id)
+}
+
+func (s *Store) SetApprovalLimit(subject string, limitMinor int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.limits[subject] = limitMinor
+}
+
+func (s *Store) ApprovalLimit(_ context.Context, subject string) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.limits[subject], nil
+}
+
+// InTx runs fn while holding a store-wide transaction lock, so concurrent
+// InTx calls are serialised (enough for tests).
+func (s *Store) InTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+	return fn(ctx)
 }

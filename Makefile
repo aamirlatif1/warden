@@ -22,9 +22,14 @@ BUF_VERSION           := v1.75.0
 PROTOC_GEN_GO_VERSION := v1.36.12
 PROTOC_GEN_GRPC_VER   := v1.6.2
 API_URL               := http://localhost:8081
+DATABASE_URL          ?= postgres://warden:warden@localhost:5434/warden?sslmode=disable
+TEST_DATABASE_URL     ?= postgres://warden:warden@localhost:5434/warden_test?sslmode=disable
+# Synthetic dev password from infra/live/local/env.hcl.
+ANNA_PASSWORD         ?= anna-dev-password
 
 .PHONY: help up down clean tools infra infra-plan infra-check check-s1 \
-	proto-tools proto proto-lint test bench run-api check-s2
+	proto-tools proto proto-lint test bench run-api check-s2 \
+	test-db seed check-s3
 
 help: ## List targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -90,3 +95,20 @@ check-s2: tools ## S2 acceptance: a real Keycloak token is accepted by policy-ap
 	check "no token rejected"         "$$(code $(API_URL)/v1/policies)" 401; \
 	check "tampered token rejected"   "$$(code -H "Authorization: Bearer $${token%?????}AAAAA" $(API_URL)/v1/policies)" 401; \
 	check "alg=none token rejected"   "$$(code -H "Authorization: Bearer $$(printf '{"alg":"none"}' | base64 | tr '+/' '-_' | tr -d '=').$$(cut -d. -f2 <<<"$$token")." $(API_URL)/v1/policies)" 401
+
+test-db: ## pgstore integration tests against the compose Postgres (needs make up)
+	@$(COMPOSE) exec -T postgres psql -q -U postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'warden_test'" | grep -q 1 \
+		|| $(COMPOSE) exec -T postgres psql -q -U postgres -c "CREATE DATABASE warden_test OWNER warden"
+	WARDEN_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' go test -race -count=1 ./internal/policy/adapters/pgstore/
+
+seed: tools ## Load demo policies and claims, owned by the Keycloak seed users (needs make infra)
+	@set -euo pipefail; \
+	ids=$$($(TG_REALM) output -json user_ids 2>/dev/null); \
+	WARDEN_DATABASE_URL='$(DATABASE_URL)' go run ./cmd/policy-seed \
+		-anna-sub "$$(jq -r .anna <<<"$$ids")" -bob-sub "$$(jq -r .bob <<<"$$ids")"
+
+check-s3: tools ## S3 acceptance: D6 (BOLA) and D7 (step-up challenge) with anna's real token (needs seed + run-api)
+	@set -euo pipefail; \
+	TEST_CLIENT_SECRET=$$($(TG_REALM) output -json client_secrets 2>/dev/null | jq -r '."warden-test"') \
+	ANNA_PASSWORD='$(ANNA_PASSWORD)' KEYCLOAK_URL='$(KEYCLOAK_URL)' API_URL='$(API_URL)' \
+	./scripts/check-s3.sh
