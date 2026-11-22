@@ -18,7 +18,7 @@ Work in progress. What runs today:
 | Keycloak realm `insurance` as code (OpenTofu + Terragrunt) | Working |
 | `policy-api` (resource server, gRPC + REST) | In progress: API, Postgres store, seed data, authz wiring and the authn/authz test suites done; token validator, JWKS cache and `authz.Decide` being written by hand |
 | `partner-sts` (custom token issuer for partners, KMS-signed) | In progress: token, revoke, introspect and admin endpoints, KMS signing, Redis revocation fan-out done; `private_key_jwt` verification and the key-rotation state machine being written by hand |
-| `bff` (policyholder portal, server-side sessions, step-up) | Planned |
+| `bff` (policyholder portal, server-side sessions, step-up) | In progress: login/logout, encrypted Redis sessions, CSRF, step-up replay, mTLS to policy-api, portal pages and claims-app done; the callback checks and refresh-under-lock being written by hand |
 | SAML federation, LDAP federation, MFA flows | Planned |
 | Attack drills, threat model, ADRs | Planned |
 
@@ -76,6 +76,8 @@ curl -s http://localhost:8080/realms/insurance/.well-known/openid-configuration 
 | `make run-sts` | Run `partner-sts` on `:8083` (`WARDEN_SIGNER=kms`, or `local` for a file key) |
 | `make demo-partner` | Partner demo: token, assertion replay refused, quote created, cross-tenant quote 403, revoke and suspend measured (401 within 1 s) |
 | `make rotate-under-load` | Rotate the STS signing key while a load loop runs; passes on zero 401s (start `run-sts` with `STS_PUBLISH_LEAD=20s`) |
+| `make pki` | Create the dev mTLS PKI in `deploy/pki` (gitignored): CA, policy-api server cert, BFF client cert |
+| `make run-bff` / `make run-claims-app` | Run the portal BFF on `:8082` and the second instance on `:8084` (SSO demo) |
 | `make check-s2` | Get a client-credentials token from Keycloak and check `policy-api` accepts it and rejects no / tampered / `alg=none` tokens |
 | `make help` | List the targets |
 
@@ -245,6 +247,45 @@ restart signs with the configured key again; production would persist it.
 Admin endpoints listen on `127.0.0.1:9083` only; production would put them
 behind mTLS or an identity-aware proxy.
 
+## bff (policyholder portal)
+
+A backend-for-frontend: the browser never sees a token. It holds one
+opaque cookie, `__Host-portal-sid` (`Secure`, `HttpOnly`, `SameSite=Lax`,
+host-only), and the BFF keeps the access, refresh and ID tokens in Redis.
+
+- **Login:** authorization code with PKCE (S256). `/login` stores `state`,
+  `nonce` and the PKCE verifier in a single-use, encrypted Redis record
+  keyed by a short-lived `__Host-portal-preauth` cookie. `/callback` checks
+  them, exchanges the code with the verifier, verifies the ID token, and
+  creates a **new** session ID (session-fixation defence).
+- **Sessions:** AES-256-GCM encrypted, with the Redis key name as
+  associated data, so a record copied under another session's key won't
+  decrypt. Redis keys are a hash of the cookie value. Idle timeout 15 min
+  (sliding), absolute 8 h.
+- **Refresh:** when the access token has under 60 s left, the BFF refreshes
+  it under a per-session Redis lock, so parallel requests refresh once.
+  Keycloak rotates refresh tokens and treats reuse as theft; a refused
+  refresh ends the session.
+- **CSRF:** a per-session synchroniser token in every form, plus an Origin
+  (or Referer) check against the BFF's own origin, plus `SameSite=Lax`.
+- **Step-up:** when policy-api answers with the RFC 9470 challenge, the BFF
+  sends the user to Keycloak with `acr_values=gold&max_age=300`, then
+  replays the pending change, but only if the same user came back.
+- **Logout:** RP-initiated (`end_session_endpoint` with `id_token_hint`).
+- **To policy-api:** REST over mTLS on `:8444` (TLS 1.3; only the BFF's
+  client certificate, pinned by its SPIFFE-style URI, is accepted). The
+  bearer token is still validated: mTLS authenticates the calling service,
+  the token the user.
+- **SSO:** `make run-claims-app` starts a second instance with client
+  `claims-app` on `:8084`. After logging in to the portal, opening it
+  needs no password. Each instance has its own cookie names, because
+  browsers don't isolate cookies by port.
+
+The full step-up (one-time code prompt) needs Keycloak's level-of-
+authentication flow, which arrives with MFA; until then Keycloak can't
+issue `acr=gold`. `__Host-` cookies over `http://localhost` work in Chrome
+and Firefox, which treat localhost as secure; Safari may refuse them.
+
 ## Repository layout
 
 ```text
@@ -264,6 +305,10 @@ internal/
   issuer/             token minting (compact JWS) over a Signer
     keyring/          signing-key rotation state machine
   revocation/         denylist set, Redis store, pub/sub subscriber
+  tlsutil/            mTLS server/client configs, dev PKI
+  bff/
+    domain/, app/     session, login transaction; login, callback, refresh, portal
+    adapters/         web (driving); oidcclient, redisstore, policyclient (driven)
   kms/                KMS and local ES256 signers, DER → JOSE conversion
   sts/
     clientauth/       private_key_jwt assertion verification
@@ -273,6 +318,8 @@ cmd/policy-seed/      demo data loader
 cmd/partner-sts/      partner token issuer (composition root)
 cmd/sts-seed/         registers a partner
 cmd/partnercli/       plays partner Shopr: keygen, assertions, tokens
+cmd/bff/              portal and claims-app BFF (composition root)
+cmd/devpki/           dev mTLS certificates
 scripts/              acceptance checks and demos
 deploy/
   compose.yaml        local stack

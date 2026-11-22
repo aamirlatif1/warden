@@ -1,0 +1,34 @@
+{{template "head" .}}
+<div class="card">
+  <h2>Hello, {{.Session.Username}}</h2>
+  <p class="muted">
+    Assurance level <span class="pill {{if eq .Session.ACR "gold"}}gold{{end}}">acr {{if .Session.ACR}}{{.Session.ACR}}{{else}}—{{end}}</span>
+    · authenticated at {{.Session.AuthTime.Format "15:04:05"}}
+  </p>
+</div>
+<div class="card">
+  <h3>Your policies</h3>
+  {{if .Policies}}
+  <table>
+    <tr><th>Policy</th><th>Product</th><th>Status</th><th>Payout account</th><th>Change payout IBAN</th></tr>
+    {{range .Policies}}
+    <tr>
+      <td><code>{{.ID}}</code></td><td>{{.Product}}</td><td>{{.Status}}</td>
+      <td><code>{{if .PayoutIBANMasked}}{{.PayoutIBANMasked}}{{else}}—{{end}}</code></td>
+      <td>
+        <form method="post" action="/payout">
+          <input type="hidden" name="csrf_token" value="{{$.Session.CSRFToken}}">
+          <input type="hidden" name="policy_id" value="{{.ID}}">
+          <input type="text" name="iban" placeholder="New IBAN" autocomplete="off" required>
+          <button>Save</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+  </table>
+  <p class="muted">Changing the payout account needs a recent strong login (step-up): you may be asked for your one-time code.</p>
+  {{else}}
+  <p class="muted">No policies found.</p>
+  {{end}}
+</div>
+{{template "foot" .}}

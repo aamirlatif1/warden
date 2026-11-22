@@ -1,0 +1,36 @@
+{{define "head"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+  :root { --fg:#1d2430; --muted:#5b6575; --line:#e3e7ee; --bg:#f6f8fb; --card:#fff; --accent:#2457d6; --warn:#b4231b; --ok:#16794c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; color:var(--fg); background:var(--bg); }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:14px 24px; display:flex; align-items:center; justify-content:space-between; }
+  header b { font-size:16px; }
+  main { max-width:880px; margin:28px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px 22px; margin-bottom:18px; }
+  .muted { color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  input[type=text] { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; width:15rem; }
+  button, .btn { font:inherit; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:7px 14px; cursor:pointer; text-decoration:none; display:inline-block; }
+  button.secondary { background:#fff; color:var(--fg); border:1px solid var(--line); }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; background:#eef2fb; font-size:12px; }
+  .pill.gold { background:#fff4d6; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); }
+  code { font-size:13px; }
+</style>
+</head>
+<body>
+<header><b>{{.Title}}</b>{{if .Session}}<form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.Session.CSRFToken}}"><button class="secondary">Log out {{.Session.Username}}</button></form>{{end}}</header>
+<main>
+{{end}}
+{{define "foot"}}
+</main>
+</body>
+</html>
+{{end}}

@@ -35,7 +35,7 @@ STS_PUBLISH_LEAD      ?= 10m
 .PHONY: help up down clean tools infra infra-plan infra-check check-s1 \
 	proto-tools proto proto-lint test bench run-api check-s2 \
 	test-db seed check-s3 kms-key partner-keys sts-seed run-sts demo-partner \
-	rotate-under-load
+	rotate-under-load pki run-bff run-claims-app
 
 help: ## List targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -87,7 +87,7 @@ test: ## go test -race ./...
 bench: ## authn benchmarks (target < 50 us/op warm)
 	go test -run '^$$' -bench . -benchmem ./internal/authn/
 
-run-api: tools ## Run policy-api (gRPC :9090, REST :8081); reads its Keycloak introspection secret from Tofu
+run-api: tools pki ## Run policy-api (gRPC :9090, REST :8081, mTLS REST :8444 for the BFF); reads its introspection secret from Tofu
 	@WARDEN_KEYCLOAK_INTROSPECT_SECRET=$$($(TG_REALM) output -json client_secrets 2>/dev/null | jq -r '."policy-api" // empty') \
 	WARDEN_STS_INTROSPECT_SECRET='$(STS_INTROSPECT_SECRET)' \
 	go run ./cmd/policy-api
@@ -109,7 +109,8 @@ test-db: ## Integration tests against compose Postgres, Redis and LocalStack KMS
 		|| $(COMPOSE) exec -T postgres psql -q -U postgres -c "CREATE DATABASE warden_test OWNER warden"
 	WARDEN_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' WARDEN_TEST_REDIS_ADDR=localhost:6379 \
 	WARDEN_TEST_KMS_ENDPOINT=http://localhost:4566 \
-		go test -race -count=1 ./internal/policy/adapters/pgstore/ ./internal/sts/adapters/... ./internal/kms/ ./internal/revocation/
+		go test -race -count=1 ./internal/policy/adapters/pgstore/ ./internal/sts/adapters/... ./internal/kms/ ./internal/revocation/ \
+		./internal/bff/adapters/redisstore/
 
 seed: tools ## Load demo policies and claims, owned by the Keycloak seed users (needs make infra)
 	@set -euo pipefail; \
@@ -152,3 +153,21 @@ demo-partner: ## Partner demo: token, D12 replay, quote, D5 403, D13 revoke + su
 
 rotate-under-load: ## Rotate the STS key while a load loop runs; expects zero 401s (run-sts with STS_PUBLISH_LEAD=20s)
 	./scripts/rotate-under-load.sh
+
+pki: ## Create the dev mTLS PKI in deploy/pki (CA, policy-api server cert, BFF client cert); kept if present
+	go run ./cmd/devpki -out deploy/pki
+
+# bff_secret reads a browser client's secret from Tofu state.
+bff_secret = $$($(TG_REALM) output -json client_secrets 2>/dev/null | jq -r '."$(1)" // empty')
+
+run-bff: tools pki ## Run the portal BFF on :8082 (client portal-bff); needs Keycloak, Redis and run-api
+	@WARDEN_BFF_CLIENT_SECRET=$(call bff_secret,portal-bff) \
+	WARDEN_BFF_INSTANCE=portal WARDEN_BFF_TITLE="Policyholder portal" \
+	WARDEN_BFF_ADDR=:8082 WARDEN_BFF_BASE_URL=http://localhost:8082 WARDEN_BFF_CLIENT_ID=portal-bff \
+	go run ./cmd/bff
+
+run-claims-app: tools pki ## Run the second BFF instance on :8084 (client claims-app) to show SSO
+	@WARDEN_BFF_CLIENT_SECRET=$(call bff_secret,claims-app) \
+	WARDEN_BFF_INSTANCE=claims WARDEN_BFF_TITLE="Claims app" \
+	WARDEN_BFF_ADDR=:8084 WARDEN_BFF_BASE_URL=http://localhost:8084 WARDEN_BFF_CLIENT_ID=claims-app \
+	go run ./cmd/bff
