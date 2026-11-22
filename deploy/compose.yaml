@@ -1,0 +1,98 @@
+# Local stack for Warden. Dev-only credentials: every secret here is a
+# throwaway value for a laptop, never reused anywhere else.
+name: warden
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    # 5432/5433 are often taken on a dev laptop; containers still use 5432.
+    ports: ["5434:5432"]
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d keycloak && pg_isready -U postgres -d warden"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: start-dev
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      # Tokens always carry iss=http://localhost:8080/realms/<realm>, while
+      # containers can still reach Keycloak at http://keycloak:8080.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports: ["8080:8080", "9000:9000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      # The image has no curl: talk HTTP over bash's /dev/tcp to the
+      # management port.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  redis:
+    image: redis:7.4-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    # --copy-service lets the image load the custom bootstrap LDIF below.
+    command: --copy-service
+    environment:
+      LDAP_ORGANISATION: Warden Insurance
+      LDAP_DOMAIN: warden.local
+      LDAP_ADMIN_PASSWORD: admin
+      LDAP_TLS: "false"
+    ports: ["1389:389"]
+    volumes:
+      - ./ldap/seed.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/50-seed.ldif:ro
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost -b ou=underwriters,dc=warden,dc=local -D cn=admin,dc=warden,dc=local -w admin uid=ben | grep -q 'numEntries: 1'"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  localstack:
+    # Pinned: newer LocalStack releases require an auth token.
+    image: localstack/localstack:4.9
+    environment:
+      SERVICES: kms,secretsmanager
+      AWS_DEFAULT_REGION: eu-central-1
+    ports: ["4566:4566"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf localhost:4566/_localstack/health | grep -q '\"kms\": \"\\(available\\|running\\)\"'"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.11.10
+    ports:
+      - "3000:3000" # Grafana (Tempo, Prometheus, Loki inside)
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+
+volumes:
+  pgdata:
