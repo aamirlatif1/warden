@@ -1,0 +1,25 @@
+# Synthetic directory for the underwriter actor. Base: dc=warden,dc=local.
+# Keycloak's LDAP federation (S7) reads ou=underwriters and maps
+# cn=underwriters to the realm role "underwriter".
+
+dn: ou=underwriters,dc=warden,dc=local
+objectClass: organizationalUnit
+ou: underwriters
+
+dn: ou=groups,dc=warden,dc=local
+objectClass: organizationalUnit
+ou: groups
+
+dn: uid=ben,ou=underwriters,dc=warden,dc=local
+objectClass: inetOrgPerson
+uid: ben
+cn: Ben Underwriter
+givenName: Ben
+sn: Underwriter
+mail: ben@warden.local
+userPassword: ben-dev-password
+
+dn: cn=underwriters,ou=groups,dc=warden,dc=local
+objectClass: groupOfNames
+cn: underwriters
+member: uid=ben,ou=underwriters,dc=warden,dc=local
