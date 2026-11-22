@@ -303,6 +303,13 @@ func TestLoginTransaction(t *testing.T) {
 	if p.State == p.Nonce || stored.Verifier == p.CodeChallenge || len(stored.Verifier) < 43 {
 		t.Fatal("state/nonce/verifier not independent or too short")
 	}
+	if p.IDPHint != "" {
+		t.Fatalf("IDPHint = %q on an ordinary login", p.IDPHint)
+	}
+	f.login(t, app.LoginRequest{IDPHint: "nordbank"})
+	if got := f.oidc.lastAuth().IDPHint; got != "nordbank" {
+		t.Fatalf("IDPHint = %q, want nordbank", got)
+	}
 }
 
 func TestSafeReturnTo(t *testing.T) {

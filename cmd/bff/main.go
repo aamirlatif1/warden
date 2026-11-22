@@ -23,11 +23,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/aamirlatif1/warden/internal/authn/jwks"
 	"github.com/aamirlatif1/warden/internal/bff/adapters/oidcclient"
 	"github.com/aamirlatif1/warden/internal/bff/adapters/policyclient"
 	"github.com/aamirlatif1/warden/internal/bff/adapters/redisstore"
 	"github.com/aamirlatif1/warden/internal/bff/adapters/web"
 	"github.com/aamirlatif1/warden/internal/bff/app"
+	"github.com/aamirlatif1/warden/internal/bff/logouttoken"
+	"github.com/aamirlatif1/warden/internal/ratelimit"
 	"github.com/aamirlatif1/warden/internal/tlsutil"
 )
 
@@ -37,6 +40,9 @@ type config struct {
 	issuer                         string
 	sessionKeyFile, redisAddr      string
 	policyAPIURL, pkiDir           string
+	idps                           string // "alias:Label,alias2:Label2"
+	adaptive                       bool
+	loginRate                      string // per IP, "LIMIT/WINDOW"
 }
 
 func loadConfig() config {
@@ -52,6 +58,9 @@ func loadConfig() config {
 		redisAddr:      env("WARDEN_REDIS_ADDR", "localhost:6379"),
 		policyAPIURL:   env("WARDEN_POLICY_API_URL", "https://localhost:8444"),
 		pkiDir:         env("WARDEN_PKI_DIR", "deploy/pki"),
+		idps:           env("WARDEN_BFF_IDPS", "nordbank:Log in with Nordbank"),
+		adaptive:       env("WARDEN_BFF_ADAPTIVE", "on") == "on",
+		loginRate:      env("WARDEN_BFF_LOGIN_RATE", "20/1m"),
 	}
 }
 
@@ -112,10 +121,39 @@ func run(log *slog.Logger) error {
 		Transport: &http.Transport{TLSClientConfig: mtls, ForceAttemptHTTP2: true},
 	})
 
+	// Keycloak's signing keys for logout tokens: the same cache policy-api
+	// uses for access tokens.
+	kcKeys := jwks.New(c.issuer+"/protocol/openid-connect/certs", jwks.Options{})
+	if err := kcKeys.Refresh(ctx); err != nil {
+		log.Warn("keycloak JWKS not fetched yet; will retry on demand", "err", err)
+	}
+	go kcKeys.Run(ctx)
+	logoutTokens, err := logouttoken.NewValidator(logouttoken.Config{
+		Issuer: c.issuer, ClientID: c.clientID,
+		Keys: kcKeys, Replay: redisstore.NewReplay(rdb, prefix),
+	})
+	if err != nil {
+		return err
+	}
+
 	// ---- use cases ----
 	auth := app.NewAuthService(op, sessions, txs, log, app.AuthConfig{})
 	tokens := app.NewTokenSource(sessions, op, locks, log, app.TokenSourceConfig{})
 	portal := app.NewPortal(tokens, api, sessions, log)
+	opts := []web.Option{web.WithBackchannel(app.NewBackchannel(logoutTokens, sessions, log))}
+	if c.adaptive {
+		// Shared prefix: one browser is one device for every instance.
+		opts = append(opts, web.WithLoginRisk(app.NewLoginRisk(redisstore.NewDevices(rdb, "bff:", 0), log)))
+	}
+	limit, window, err := ratelimit.ParseRate(c.loginRate)
+	if err != nil {
+		return err
+	}
+	loginLimit, err := ratelimit.New(rdb, ratelimit.Config{Prefix: "warden:rl:" + prefix + "login-ip:", Limit: limit, Window: window})
+	if err != nil {
+		return err
+	}
+	opts = append(opts, web.WithLoginLimit(loginLimit))
 
 	// ---- HTTP ----
 	idp, _ := url.Parse(c.issuer)
@@ -123,7 +161,8 @@ func run(log *slog.Logger) error {
 		Title: c.title, BaseURL: c.baseURL,
 		CookiePrefix: "__Host-" + c.instance + "-",
 		IdPOrigin:    idp.Scheme + "://" + idp.Host,
-	}, auth, portal, sessions, log)
+		IdPs:         parseIdPs(c.idps),
+	}, auth, portal, sessions, log, opts...)
 	if err != nil {
 		return err
 	}
@@ -149,6 +188,21 @@ func run(log *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpSrv.Shutdown(shutdownCtx)
+}
+
+// parseIdPs reads "alias:Label,alias2:Label2"; "" or "none" offers none.
+func parseIdPs(s string) []web.IdP {
+	var out []web.IdP
+	if s == "none" {
+		return nil
+	}
+	for _, part := range strings.Split(s, ",") {
+		alias, label, ok := strings.Cut(strings.TrimSpace(part), ":")
+		if ok && alias != "" && label != "" {
+			out = append(out, web.IdP{Alias: alias, Label: label})
+		}
+	}
+	return out
 }
 
 // loadOrCreateKey reads a base64 32-byte AES key, creating one (0600) for

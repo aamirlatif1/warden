@@ -20,6 +20,28 @@ resource "keycloak_realm" "this" {
 
   password_policy = "length(12) and notUsername and passwordHistory(3)"
 
+  # Level of Authentication: acr_values=gold asks for level 2 in the
+  # browser-mfa flow; tokens carry acr=silver (1) or acr=gold (2).
+  attributes = {
+    "acr.loa.map" = jsonencode({ silver = 1, gold = 2 })
+  }
+
+  # TOTP for underwriters and step-up (RFC 6238 defaults; any authenticator app).
+  otp_policy {
+    type      = "totp"
+    algorithm = "HmacSHA1"
+    digits    = 6
+    period    = 30
+  }
+
+  # WebAuthn as the alternative second factor at level 2: phishing-resistant
+  # because the credential is bound to the origin.
+  web_authn_policy {
+    relying_party_entity_name     = "Warden Insurance"
+    signature_algorithms          = ["ES256", "RS256"]
+    user_verification_requirement = "preferred"
+  }
+
   security_defenses {
     brute_force_detection {
       permanent_lockout                = false

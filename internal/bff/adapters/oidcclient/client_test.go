@@ -135,8 +135,12 @@ func TestAuthURL(t *testing.T) {
 		t.Errorf("scope = %q", q.Get("scope"))
 	}
 	plain, _ := url.Parse(c.AuthURL(app.AuthParams{State: "st"}))
-	if plain.Query().Has("acr_values") || plain.Query().Has("max_age") {
-		t.Error("step-up params sent on an ordinary login")
+	if plain.Query().Has("acr_values") || plain.Query().Has("max_age") || plain.Query().Has("kc_idp_hint") {
+		t.Error("step-up or broker params sent on an ordinary login")
+	}
+	broker, _ := url.Parse(c.AuthURL(app.AuthParams{State: "st", IDPHint: "nordbank"}))
+	if got := broker.Query().Get("kc_idp_hint"); got != "nordbank" {
+		t.Errorf("kc_idp_hint = %q, want nordbank", got)
 	}
 }
 

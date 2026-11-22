@@ -19,6 +19,7 @@ type AuthParams struct {
 	CodeChallenge string // S256(verifier), base64url
 	ACRValues     string // "" or "gold"
 	MaxAge        time.Duration
+	IDPHint       string // "" or a broker alias (kc_idp_hint), e.g. "nordbank"
 }
 
 type Tokens struct {

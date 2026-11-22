@@ -82,6 +82,10 @@ func (c *Client) AuthURL(p app.AuthParams) string {
 	if p.MaxAge > 0 {
 		opts = append(opts, oauth2.SetAuthURLParam("max_age", strconv.Itoa(int(p.MaxAge.Seconds()))))
 	}
+	if p.IDPHint != "" {
+		// Keycloak-specific: go straight to the brokered IdP's login.
+		opts = append(opts, oauth2.SetAuthURLParam("kc_idp_hint", p.IDPHint))
+	}
 	return c.conf.AuthCodeURL(p.State, opts...)
 }
 

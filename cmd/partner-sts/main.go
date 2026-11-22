@@ -23,6 +23,7 @@ import (
 	"github.com/aamirlatif1/warden/internal/issuer"
 	"github.com/aamirlatif1/warden/internal/issuer/keyring"
 	"github.com/aamirlatif1/warden/internal/kms"
+	"github.com/aamirlatif1/warden/internal/ratelimit"
 	"github.com/aamirlatif1/warden/internal/revocation"
 	"github.com/aamirlatif1/warden/internal/sts/adapters/httpapi"
 	"github.com/aamirlatif1/warden/internal/sts/adapters/pgstore"
@@ -43,6 +44,7 @@ type cfg struct {
 	kmsKeyID, kmsEndpoint  string
 	region, localKeyFile   string
 	databaseURL, redisAddr string
+	ipRate, clientRate     string // /token budgets, "LIMIT/WINDOW"
 }
 
 func loadConfig() cfg {
@@ -54,6 +56,8 @@ func loadConfig() cfg {
 		publishLead: durationEnv("WARDEN_STS_PUBLISH_LEAD", 10*time.Minute),
 		// policy-api's credentials for /introspect; empty disables the endpoint.
 		introspectSecret: os.Getenv("WARDEN_STS_INTROSPECT_SECRET"),
+		ipRate:           env("WARDEN_STS_TOKEN_RATE_IP", "60/1m"),
+		clientRate:       env("WARDEN_STS_TOKEN_RATE_CLIENT", "30/1m"),
 		signer:           env("WARDEN_SIGNER", "kms"),
 		kmsKeyID:         env("WARDEN_KMS_KEY_ID", "alias/warden-sts"),
 		kmsEndpoint:      env("WARDEN_KMS_ENDPOINT", "http://localhost:4566"), // LocalStack; empty = real AWS
@@ -139,6 +143,10 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("client auth config: %w", err)
 	}
 	tokens := app.NewTokenService(verifier, store, minter, log)
+	limits, err := tokenLimits(rdb, c)
+	if err != nil {
+		return err
+	}
 	lifecycle := app.NewLifecycle(verifier, minter, revocation.NewStore(rdb), store, ring, log)
 
 	introspectors := map[string]string{}
@@ -154,7 +162,7 @@ func run(log *slog.Logger) error {
 			Issuer:               c.issuer,
 			JWKSMaxAge:           int((c.publishLead / 2).Seconds()),
 			IntrospectionClients: introspectors,
-		}, httpapi.Services{Tokens: tokens, Lifecycle: lifecycle, Keys: minter}, log),
+		}, httpapi.Services{Tokens: tokens, Lifecycle: lifecycle, Keys: minter, Limits: limits}, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -223,4 +231,24 @@ func newSigner(ctx context.Context, c cfg) (issuer.Signer, keyring.KeyFactory, e
 	default:
 		return nil, nil, fmt.Errorf("WARDEN_SIGNER must be kms or local, got %q", c.signer)
 	}
+}
+
+// tokenLimits builds /token's per-IP and per-client sliding windows.
+func tokenLimits(rdb *redis.Client, c cfg) (httpapi.TokenLimits, error) {
+	build := func(name, rate string) (*ratelimit.Limiter, error) {
+		n, w, err := ratelimit.ParseRate(rate)
+		if err != nil {
+			return nil, err
+		}
+		return ratelimit.New(rdb, ratelimit.Config{Prefix: "warden:rl:sts-token-" + name + ":", Limit: n, Window: w})
+	}
+	ip, err := build("ip", c.ipRate)
+	if err != nil {
+		return httpapi.TokenLimits{}, err
+	}
+	client, err := build("client", c.clientRate)
+	if err != nil {
+		return httpapi.TokenLimits{}, err
+	}
+	return httpapi.TokenLimits{PerIP: ip, PerClient: client}, nil
 }

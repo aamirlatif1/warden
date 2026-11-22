@@ -19,7 +19,7 @@ Work in progress. What runs today:
 | `policy-api` (resource server, gRPC + REST) | In progress: API, Postgres store, seed data, authz wiring and the authn/authz test suites done; token validator, JWKS cache and `authz.Decide` being written by hand |
 | `partner-sts` (custom token issuer for partners, KMS-signed) | In progress: token, revoke, introspect and admin endpoints, KMS signing, Redis revocation fan-out done; `private_key_jwt` verification and the key-rotation state machine being written by hand |
 | `bff` (policyholder portal, server-side sessions, step-up) | In progress: login/logout, encrypted Redis sessions, CSRF, step-up replay, mTLS to policy-api, portal pages and claims-app done; the callback checks and refresh-under-lock being written by hand |
-| SAML federation, LDAP federation, MFA flows | Planned |
+| SAML federation, LDAP federation, MFA flows | Working in Keycloak (applied and checked with a scripted browser); the BFF's back-channel logout validator and the rate limiter are being written by hand |
 | Attack drills, threat model, ADRs | Planned |
 
 The design, actors, trust boundaries and data flows are in
@@ -78,6 +78,7 @@ curl -s http://localhost:8080/realms/insurance/.well-known/openid-configuration 
 | `make rotate-under-load` | Rotate the STS signing key while a load loop runs; passes on zero 401s (start `run-sts` with `STS_PUBLISH_LEAD=20s`) |
 | `make pki` | Create the dev mTLS PKI in `deploy/pki` (gitignored): CA, policy-api server cert, BFF client cert |
 | `make run-bff` / `make run-claims-app` | Run the portal BFF on `:8082` and the second instance on `:8084` (SSO demo) |
+| `make infra-cognito` | Validate and `tofu test` the Cognito module against a mocked AWS provider (never applied) |
 | `make check-s2` | Get a client-credentials token from Keycloak and check `policy-api` accepts it and rejects no / tampered / `alg=none` tokens |
 | `make help` | List the targets |
 
@@ -121,9 +122,62 @@ machine.
 - **Seed users** (synthetic): `anna` and `bob`, both `policyholder`. Their
   passwords are in `infra/live/local/env.hcl`.
 
-The LDAP directory (`deploy/ldap/seed.ldif`) holds the underwriter `ben`
-(password `ben-dev-password`) in group `underwriters`. Keycloak doesn't
-federate it yet.
+- **Browser flow `browser-mfa`:** cookie (SSO), identity-provider
+  redirector (for `kc_idp_hint`), then a Level of Authentication flow:
+  - level 1 (`acr=silver`): password, plus a one-time code for users with
+    the role `underwriter` (conditional MFA by role);
+  - level 2 (`acr=gold`, asked for with `acr_values=gold`, max age 5 min):
+    a WebAuthn security key if the user has one registered, otherwise a
+    TOTP code, enrolled on the spot if the user has none yet.
+- **WebAuthn policy** (ES256/RS256, user verification preferred) and a
+  TOTP policy (6 digits, 30 s).
+
+`infra/modules/keycloak-ldap` federates the OpenLDAP directory
+(`deploy/ldap/seed.ldif`), read-only. The underwriter `ben` (password
+`ben-dev-password`) is imported at first login; LDAP group `underwriters`
+maps to the Keycloak group of the same name, which carries the realm role
+`underwriter`.
+
+`infra/modules/keycloak-broker` creates realm `nordbank`, which plays the
+partner bank's SAML 2.0 identity provider, with the synthetic customer
+`nora` (`nora-dev-password`). In `insurance` it adds Nordbank as a SAML
+identity provider: signed assertions only, verified with the bank realm's
+certificate (read from Keycloak by Tofu), persistent NameID, first broker
+login, and mappers for email and name, a hard-coded `partner_id=nordbank`
+and the role `policyholder`. The tenant is stamped by the broker, never
+read from the assertion.
+
+`infra/modules/cognito-user-pool` is the AWS Cognito version of the partner
+setup (user pool, resource server with custom scopes, a client-credentials
+app client per partner). It is never applied: `make infra-cognito` runs
+`tofu validate` and `tofu test` with a mocked provider. The differences
+that matter to a resource server: Cognito access tokens carry `client_id`
+and `token_use=access` instead of `aud`, scopes are prefixed with the
+resource server identifier, and app clients authenticate with a client
+secret (no `private_key_jwt`).
+
+### Checked against the running Keycloak (S7)
+
+Observed with a scripted browser (cookie jar, form posts, SAML POST
+binding) and the admin API, not with the BFF yet:
+
+| Check | Observed |
+| --- | --- |
+| anna, ordinary login | password only, `acr=silver` |
+| anna, `acr_values=gold` | password, then TOTP enrolment, then `acr=gold` |
+| anna, gold from an existing silver SSO session | only the TOTP prompt, `acr=gold`, same `sid` |
+| ben (LDAP) | imported on first login; token has role `underwriter` and group `underwriters`; browser login asks him to set up TOTP |
+| nora via Nordbank | SAML AuthnRequest → bank login → signed response → account `nordbank.nora@nordbank.example` with `partner_id=nordbank`; second login links the same account |
+| SAML response with the email swapped in transit | Keycloak rejects it: `invalid_signature` |
+| Admin deletes a session | Keycloak POSTs a `logout_token` to the client's `/backchannel-logout` (RS256, `typ: logout+jwt`, `aud`, `sid`, `events`, no `nonce`) |
+| Admin "sign out all sessions" with 3 sessions | **one** back-channel call, carrying one `sid`: the BFF ends that session only; the others die at their next refresh (at most the 5 min access-token lifetime). Deleting sessions one by one sends one call each |
+| Second `make infra` | no changes |
+
+Found along the way: two `ALTERNATIVE` second factors at level 2 make
+Keycloak fail the login when the user has neither (it does not offer
+enrolment), hence the conditional sub-flows. The password grant on the
+local test client skips the browser flow, and with it the underwriter's
+OTP: it exists only in `live/local`.
 
 ## Try it: get a token
 
@@ -247,6 +301,15 @@ restart signs with the configured key again; production would persist it.
 Admin endpoints listen on `127.0.0.1:9083` only; production would put them
 behind mTLS or an identity-aware proxy.
 
+`/token` is rate-limited twice, sliding window in Redis, 429 with
+`Retry-After`: 60 a minute per client IP, checked before the body is read,
+and 30 a minute per claimed `client_id` (the form parameter, else the
+unverified `iss` of the assertion). That client_id isn't authenticated
+yet, so anyone can spend a partner's budget: the per-client limit is set
+high enough that this costs a partner little, and the per-IP limit is what
+stops one source. All Gin routers ignore `X-Forwarded-For`, so the per-IP
+key is the TCP peer and can't be rotated with a header.
+
 ## bff (policyholder portal)
 
 A backend-for-frontend: the browser never sees a token. It holds one
@@ -271,7 +334,23 @@ host-only), and the BFF keeps the access, refresh and ID tokens in Redis.
 - **Step-up:** when policy-api answers with the RFC 9470 challenge, the BFF
   sends the user to Keycloak with `acr_values=gold&max_age=300`, then
   replays the pending change, but only if the same user came back.
-- **Logout:** RP-initiated (`end_session_endpoint` with `id_token_hint`).
+- **Logout:** RP-initiated (`end_session_endpoint` with `id_token_hint`),
+  and OIDC back-channel logout: Keycloak POSTs a `logout_token` to
+  `/backchannel-logout`, the BFF validates it (signature, `iss`, `aud`,
+  `events`, no `nonce`, `sid`, `jti` replay) and deletes every session for
+  that Keycloak `sid`. No cookies and no CSRF token on that route: it is
+  server to server.
+- **Federation:** "Log in with Nordbank" sends `kc_idp_hint=nordbank`; only
+  configured aliases are accepted.
+- **Adaptive step-up:** a device cookie (`__Host-warden-device`, shared by
+  both instances) and the simulated `X-Country` header. A device that never
+  completed a login, or a new country on a known device, makes the login
+  ask for `acr_values=gold` (`authz.AssessLogin`). Not for Nordbank logins:
+  the bank runs its own MFA, and a brokered login can't reach `gold` here.
+- **Rate limit:** `/login` allows 20 requests a minute per client IP
+  (`WARDEN_BFF_LOGIN_RATE`), sliding window in Redis, 429 with
+  `Retry-After`. Password guessing itself happens at Keycloak, whose
+  brute-force detection locks the account after 5 failures.
 - **To policy-api:** REST over mTLS on `:8444` (TLS 1.3; only the BFF's
   client certificate, pinned by its SPIFFE-style URI, is accepted). The
   bearer token is still validated: mTLS authenticates the calling service,
@@ -281,9 +360,7 @@ host-only), and the BFF keeps the access, refresh and ID tokens in Redis.
   needs no password. Each instance has its own cookie names, because
   browsers don't isolate cookies by port.
 
-The full step-up (one-time code prompt) needs Keycloak's level-of-
-authentication flow, which arrives with MFA; until then Keycloak can't
-issue `acr=gold`. `__Host-` cookies over `http://localhost` work in Chrome
+`__Host-` cookies over `http://localhost` work in Chrome
 and Firefox, which treat localhost as secure; Safari may refuse them.
 
 ## Repository layout
@@ -305,9 +382,13 @@ internal/
   issuer/             token minting (compact JWS) over a Signer
     keyring/          signing-key rotation state machine
   revocation/         denylist set, Redis store, pub/sub subscriber
+  ratelimit/          sliding-window limiter (Redis)
+    ginlimit/         Gin middleware: 429 + Retry-After, fail closed
   tlsutil/            mTLS server/client configs, dev PKI
   bff/
-    domain/, app/     session, login transaction; login, callback, refresh, portal
+    domain/, app/     session, login transaction; login, callback, refresh, portal,
+                      back-channel logout, adaptive login risk
+    logouttoken/      back-channel logout_token validation
     adapters/         web (driving); oidcclient, redisstore, policyclient (driven)
   kms/                KMS and local ES256 signers, DER → JOSE conversion
   sts/
@@ -328,7 +409,8 @@ deploy/
   tools/Dockerfile    OpenTofu + Terragrunt image
 infra/
   root.hcl            generates provider and backend config for every unit
-  modules/            plain OpenTofu modules (keycloak-realm, ...)
+  modules/            plain OpenTofu modules: keycloak-realm, keycloak-ldap,
+                      keycloak-broker, cognito-user-pool (mocked tests only)
   live/local/         env.hcl inputs + one Terragrunt unit per module
 docs/
   design.md           actors, trust boundaries, data-flow diagram, flows

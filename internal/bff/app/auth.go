@@ -40,6 +40,7 @@ type LoginRequest struct {
 	MaxAge         time.Duration
 	Pending        *domain.PendingAction
 	PendingSubject string
+	IDPHint        string // skip Keycloak's login page and go to this broker
 }
 
 // Login creates the single-use login transaction (state, nonce, PKCE
@@ -63,7 +64,7 @@ func (a *AuthService) Login(ctx context.Context, req LoginRequest) (txID, redire
 	}
 	url := a.oidc.AuthURL(AuthParams{
 		State: tx.State, Nonce: tx.Nonce, CodeChallenge: pkceChallenge(tx.Verifier),
-		ACRValues: tx.ACRValues, MaxAge: tx.MaxAge,
+		ACRValues: tx.ACRValues, MaxAge: tx.MaxAge, IDPHint: req.IDPHint,
 	})
 	return tx.ID, url, nil
 }

@@ -37,6 +37,9 @@ type handlers struct {
 func NewRouter(svc PolicyService, auth gin.HandlerFunc, log *slog.Logger) *gin.Engine {
 	h := &handlers{svc: svc, log: log}
 	r := gin.New()
+	// Logs and limits must see the TCP peer, not a client-sent
+	// X-Forwarded-For.
+	_ = r.SetTrustedProxies(nil)
 	// Custom recovery: gin's default dumps request headers to the log.
 	r.Use(gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, rec any) {
 		log.ErrorContext(c.Request.Context(), "panic in handler", "method", c.Request.Method, "path", c.FullPath(), "panic", rec)
